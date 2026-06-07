@@ -833,7 +833,7 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
 
 elif [[ "$PKG_MANAGER" == "apk" ]]; then
     PKGS=(
-        bash curl wget git fail2ban iptables ip6tables ipset pam
+        bash curl wget git fail2ban iptables ip6tables ipset linux-pam
         ca-certificates htop net-tools make gcc musl-dev linux-headers
         grep tzdata openssh openssl dcron
     )
