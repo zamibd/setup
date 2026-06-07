@@ -2,10 +2,10 @@
 # ================================================================
 #  RAHMAT — DNS SaaS Server Setup Script
 #  Supports : Ubuntu 22.04+ (LTS & interim) | Debian (all) | AlmaLinux (all)
-#             Rocky · RHEL · CentOS Stream · Fedora (latest)
+#             Rocky · RHEL · CentOS Stream · Fedora (latest) | Alpine Linux 3.x+
 #  Author   : RAHMAT
 #  GitHub   : https://github.com/zamibd/setup/setup.sh
-#  Version  : 2.7.0
+#  Version  : 2.8.1
 # ================================================================
 
 set -euo pipefail
@@ -159,7 +159,7 @@ valid_ssh_pubkey() {
 
 sshd_test_and_reload() {
     if sshd -t 2>/dev/null; then
-        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
+        svc_reload_sshd
         ok "sshd config validated & reloaded"
     else
         warn "sshd config test failed — fix manually before reload"
@@ -172,6 +172,100 @@ port_is_bound() {
         ss -Hln "$proto" 2>/dev/null | grep -qE "[:.]${port}([^0-9]|$)" && return 0
     fi
     return 1
+}
+
+extract_semver() {
+    sed -nE 's/.*([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -1
+}
+
+extract_version_short() {
+    sed -nE 's/.*([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p' | head -1
+}
+
+has_systemd() {
+    [[ -d /run/systemd/system ]] && command -v systemctl &>/dev/null
+}
+
+svc_daemon_reload() {
+    has_systemd && systemctl daemon-reload 2>/dev/null || true
+}
+
+svc_enable_now() {
+    local svc="$1"
+    if has_systemd; then
+        systemctl enable --now "$svc" 2>/dev/null || true
+    elif command -v rc-update &>/dev/null; then
+        rc-update add "$svc" boot 2>/dev/null || true
+        rc-service "$svc" start 2>/dev/null || service "$svc" start 2>/dev/null || true
+    fi
+}
+
+svc_is_active() {
+    local svc="$1"
+    if has_systemd; then
+        systemctl is-active --quiet "$svc" 2>/dev/null
+    elif command -v rc-service &>/dev/null; then
+        rc-service "$svc" status 2>/dev/null | grep -qiE 'started|running'
+    else
+        return 1
+    fi
+}
+
+svc_disable_now() {
+    local svc="$1"
+    if has_systemd; then
+        systemctl disable --now "$svc" 2>/dev/null || true
+    elif command -v rc-service &>/dev/null; then
+        rc-service "$svc" stop 2>/dev/null || true
+        rc-update del "$svc" boot 2>/dev/null || true
+    fi
+}
+
+svc_restart() {
+    local svc="$1"
+    if has_systemd; then
+        systemctl restart "$svc" 2>/dev/null || true
+    else
+        rc-service "$svc" restart 2>/dev/null || service "$svc" restart 2>/dev/null || true
+    fi
+}
+
+svc_reload_sshd() {
+    if has_systemd; then
+        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
+    else
+        rc-service sshd reload 2>/dev/null || rc-service ssh reload 2>/dev/null || \
+            kill -HUP "$(pidof sshd 2>/dev/null | awk '{print $1}')" 2>/dev/null || true
+    fi
+}
+
+get_timezone() {
+    if command -v timedatectl &>/dev/null; then
+        timedatectl show -p Timezone --value 2>/dev/null || echo "unknown"
+    elif [[ -L /etc/localtime ]]; then
+        readlink /etc/localtime | sed 's|.*/zoneinfo/||'
+    else
+        echo "unknown"
+    fi
+}
+
+set_system_timezone() {
+    if command -v timedatectl &>/dev/null; then
+        timedatectl set-timezone "$TIMEZONE"
+    else
+        command -v apk &>/dev/null && apk add --no-cache tzdata >/dev/null 2>&1 || true
+        ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
+        echo "$TIMEZONE" > /etc/timezone 2>/dev/null || true
+    fi
+}
+
+enable_apk_community_repo() {
+    [[ -f /etc/apk/repositories ]] || return 0
+    if grep -qE '^[^#].*/community' /etc/apk/repositories; then
+        return 0
+    fi
+    sed -i 's|^#\(.*/community\)|\1|' /etc/apk/repositories 2>/dev/null || \
+        sed -i '' 's|^#\(.*/community\)|\1|' /etc/apk/repositories 2>/dev/null || true
 }
 
 apply_ddos_kernel() {
@@ -309,7 +403,8 @@ $IPT -A "$CHAIN" -j RETURN
 EOFSCRIPT
     chmod +x "$DDOS_SCRIPT"
 
-    cat > /etc/systemd/system/rahmat-ddos.service << EOF
+    if has_systemd; then
+        cat > /etc/systemd/system/rahmat-ddos.service << EOF
 [Unit]
 Description=RAHMAT DDoS mitigation iptables rules
 After=network-online.target ufw.service firewalld.service docker.service
@@ -323,10 +418,22 @@ ExecStart=${DDOS_SCRIPT}
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    systemctl enable rahmat-ddos.service > /dev/null 2>&1
-    systemctl restart rahmat-ddos.service > /dev/null 2>&1 || bash "$DDOS_SCRIPT" || true
+        svc_daemon_reload
+        systemctl enable rahmat-ddos.service > /dev/null 2>&1
+        systemctl restart rahmat-ddos.service > /dev/null 2>&1 || bash "$DDOS_SCRIPT" || true
+    else
+        mkdir -p /etc/local.d /etc/iptables
+        cat > /etc/local.d/rahmat-network.start << EOF
+#!/bin/sh
+# RAHMAT — Alpine/OpenRC firewall + DDoS rules at boot
+[ -x /etc/rahmat/apply-alpine-firewall.sh ] && /etc/rahmat/apply-alpine-firewall.sh
+${DDOS_SCRIPT}
+iptables-save > /etc/iptables/rules-save 2>/dev/null || true
+EOF
+        chmod +x /etc/local.d/rahmat-network.start
+        bash "$DDOS_SCRIPT" || true
+        ok "OpenRC boot script → /etc/local.d/rahmat-network.start"
+    fi
 }
 
 apply_ddos_firewalld() {
@@ -494,9 +601,8 @@ configure_apt_os() {
 
 configure_dnf_os() {
     local label="$1"
-    local repo="$2"
-    local epel="${3:-true}"
-    DOCKER_DNF_REPO="$repo"
+    local epel="${2:-true}"
+    DOCKER_DNF_REPO=$(resolve_docker_dnf_repo)
     NEEDS_EPEL="$epel"
     PKG_MANAGER="dnf"
     OS_FAMILY="rhel"
@@ -504,8 +610,56 @@ configure_dnf_os() {
     ok "${BGREEN}${label}${RESET} — supported"
     detail "Version     : ${OS_VERSION:-rolling}"
     detail "Arch        : $(uname -m)"
-    detail "Docker repo : ${repo##*/}"
+    detail "Docker repo : ${DOCKER_DNF_REPO##*/}"
+    is_rhel_el10_plus && detail "EL10+ notes  : iptables-nft + kernel-modules-extra"
     [[ "$NEEDS_EPEL" == "true" ]] && detail "EPEL        : enabled"
+}
+
+rhel_major_version() {
+    echo "${OS_VERSION:-0}" | cut -d. -f1
+}
+
+is_rhel_el10_plus() {
+    local major
+    major=$(rhel_major_version)
+    [[ "$major" =~ ^[0-9]+$ ]] && [[ "$major" -ge 10 ]]
+}
+
+resolve_docker_dnf_repo() {
+    case "$OS_ID" in
+        rhel|redhat)
+            echo "https://download.docker.com/linux/rhel/docker-ce.repo"
+            ;;
+        fedora)
+            echo "https://download.docker.com/linux/fedora/docker-ce.repo"
+            ;;
+        *)
+            if is_rhel_el10_plus; then
+                echo "https://download.docker.com/linux/rhel/docker-ce.repo"
+            else
+                echo "https://download.docker.com/linux/centos/docker-ce.repo"
+            fi
+            ;;
+    esac
+}
+
+alpine_version_ok() {
+    local ver="$1"
+    local major
+    major=$(echo "$ver" | cut -d. -f1)
+    [[ "$major" =~ ^[0-9]+$ ]] && [[ "$major" -ge 3 ]]
+}
+
+configure_apk_os() {
+    local label="$1"
+    PKG_MANAGER="apk"
+    OS_FAMILY="alpine"
+    OS_DISPLAY="$label"
+    ok "${BGREEN}${label}${RESET} — supported"
+    detail "Version     : ${OS_VERSION:-unknown}"
+    detail "Arch        : $(uname -m)"
+    detail "Init        : $(has_systemd && echo systemd || echo openrc)"
+    detail "Firewall    : iptables (Alpine)"
 }
 
 case "$OS_ID" in
@@ -530,28 +684,28 @@ case "$OS_ID" in
         configure_apt_os "${PRETTY_NAME}" "debian"
         ;;
     almalinux)
-        configure_dnf_os "AlmaLinux ${OS_VERSION:-}" \
-            "https://download.docker.com/linux/centos/docker-ce.repo"
+        configure_dnf_os "AlmaLinux ${OS_VERSION:-}"
         ;;
     rocky|rockylinux)
-        configure_dnf_os "Rocky Linux ${OS_VERSION:-}" \
-            "https://download.docker.com/linux/centos/docker-ce.repo"
+        configure_dnf_os "Rocky Linux ${OS_VERSION:-}"
         ;;
     centos|centos_stream)
-        configure_dnf_os "CentOS ${OS_VERSION:-}" \
-            "https://download.docker.com/linux/centos/docker-ce.repo"
+        configure_dnf_os "CentOS ${OS_VERSION:-}"
         ;;
     rhel|redhat)
-        configure_dnf_os "RHEL ${OS_VERSION:-}" \
-            "https://download.docker.com/linux/rhel/docker-ce.repo"
+        configure_dnf_os "RHEL ${OS_VERSION:-}"
         ;;
     ol|oraclelinux|oracle)
-        configure_dnf_os "Oracle Linux ${OS_VERSION:-}" \
-            "https://download.docker.com/linux/centos/docker-ce.repo"
+        configure_dnf_os "Oracle Linux ${OS_VERSION:-}"
         ;;
     fedora)
-        configure_dnf_os "Fedora ${OS_VERSION:-}" \
-            "https://download.docker.com/linux/fedora/docker-ce.repo" "false"
+        configure_dnf_os "Fedora ${OS_VERSION:-}" "false"
+        ;;
+    alpine)
+        [[ -n "$OS_VERSION" ]] || fail "Could not detect Alpine version"
+        alpine_version_ok "$OS_VERSION" || \
+            fail "Alpine Linux 3.x+ required. Found: $OS_VERSION"
+        configure_apk_os "Alpine Linux ${OS_VERSION}"
         ;;
     *)
         # Fallback: detect via ID_LIKE for unknown derivatives
@@ -563,13 +717,17 @@ case "$OS_ID" in
         elif [[ "$ID_LIKE" == *debian* ]]; then
             configure_apt_os "${PRETTY_NAME}" "debian"
         elif [[ "$ID_LIKE" == *rhel* ]] || [[ "$ID_LIKE" == *fedora* ]]; then
-            configure_dnf_os "${PRETTY_NAME}" \
-                "https://download.docker.com/linux/centos/docker-ce.repo"
+            configure_dnf_os "${PRETTY_NAME}"
+        elif [[ "$ID_LIKE" == *alpine* ]] || [[ "$OS_ID" == *alpine* ]]; then
+            alpine_version_ok "${OS_VERSION:-3}" || fail "Alpine Linux 3.x+ required."
+            configure_apk_os "${PRETTY_NAME:-Alpine Linux ${OS_VERSION:-}}"
         else
-            fail "Unsupported OS: '$OS_ID'. Supported: Ubuntu 22+, Debian, AlmaLinux, Rocky, RHEL, CentOS, Fedora"
+            fail "Unsupported OS: '$OS_ID'. Supported: Ubuntu 22+, Debian, Alpine 3.x+, AlmaLinux, Rocky, RHEL, CentOS, Fedora"
         fi
         ;;
 esac
+
+[[ "$OS_FAMILY" == "alpine" ]] && DOCKER_CGROUP_DRIVER="cgroupfs"
 
 detail "Package mgr : $PKG_MANAGER"
 detail "OS family   : $OS_FAMILY"
@@ -606,6 +764,15 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
     else
         skip "EPEL (not required on $OS_DISPLAY)"
     fi
+
+elif [[ "$PKG_MANAGER" == "apk" ]]; then
+    enable_apk_community_repo
+    info "Running apk update..."
+    apk update
+    ok "Package index refreshed"
+    info "Running apk upgrade (this may take a while)..."
+    apk upgrade -a
+    ok "System packages upgraded successfully"
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -663,12 +830,106 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
     else
         ok "All essential packages already present"
     fi
+
+elif [[ "$PKG_MANAGER" == "apk" ]]; then
+    PKGS=(
+        bash curl wget git fail2ban iptables ip6tables ipset pam
+        ca-certificates htop net-tools make gcc musl-dev linux-headers
+        grep tzdata openssh openssl dcron
+    )
+    TO_INSTALL=()
+    for pkg in "${PKGS[@]}"; do
+        if apk info -e "$pkg" &>/dev/null; then
+            skip "${GREEN}${pkg}${RESET}"
+        else
+            info "queued: ${HACK_WARN}${pkg}${RESET}"
+            TO_INSTALL+=("$pkg")
+        fi
+    done
+    if [[ ${#TO_INSTALL[@]} -gt 0 ]]; then
+        echo ""
+        info "installing ${HACK_WARN}${#TO_INSTALL[@]}${RESET} package(s)..."
+        apk add --no-cache "${TO_INSTALL[@]}"
+        ok "All packages installed"
+    else
+        ok "All essential packages already present"
+    fi
 fi
 
 # ────────────────────────────────────────────────────────────────
 # STEP 4 — Docker & Docker Compose
 # ────────────────────────────────────────────────────────────────
 step 4 "$TOTAL_STEPS" "Docker Engine & Docker Compose"
+
+rhel_docker_journal_tail() {
+    journalctl -u docker.service -n 20 --no-pager 2>/dev/null | tail -10 || true
+}
+
+prepare_docker_dnf_host() {
+    info "Preparing RHEL-family host for Docker..."
+    modprobe overlay 2>/dev/null || true
+    modprobe br_netfilter 2>/dev/null || true
+
+    local _extra_pkgs=()
+    rpm -q iptables-nft &>/dev/null || _extra_pkgs+=(iptables-nft)
+    if is_rhel_el10_plus; then
+        rpm -q kernel-modules-extra &>/dev/null || _extra_pkgs+=(kernel-modules-extra)
+    fi
+    if [[ ${#_extra_pkgs[@]} -gt 0 ]]; then
+        info "Installing Docker prerequisites: ${_extra_pkgs[*]}..."
+        dnf install -y -q "${_extra_pkgs[@]}" 2>/dev/null || \
+            warn "Could not install all Docker prerequisites (${_extra_pkgs[*]})"
+    fi
+
+    modprobe br_netfilter 2>/dev/null || true
+    modprobe xt_addrtype 2>/dev/null || true
+
+    cat > /etc/modules-load.d/rahmat-docker.conf << 'EOF'
+overlay
+br_netfilter
+EOF
+    cat > /etc/sysctl.d/99-rahmat-docker-bridge.conf << 'EOF'
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+EOF
+    sysctl -p /etc/sysctl.d/99-rahmat-docker-bridge.conf > /dev/null 2>&1 || true
+
+    systemctl enable containerd > /dev/null 2>&1 || true
+    systemctl start containerd > /dev/null 2>&1 || true
+    ok "Docker host prerequisites applied (containerd, iptables, kernel modules)"
+}
+
+ensure_docker_running() {
+    svc_daemon_reload
+    systemctl enable docker > /dev/null 2>&1 || true
+    systemctl start containerd > /dev/null 2>&1 || true
+
+    if systemctl start docker 2>/dev/null && systemctl is-active --quiet docker; then
+        ok "Docker service enabled & started"
+        return 0
+    fi
+
+    warn "Docker failed to start — running AlmaLinux/RHEL recovery..."
+    prepare_docker_dnf_host
+    modprobe xt_addrtype 2>/dev/null || true
+    systemctl restart containerd 2>/dev/null || true
+    sleep 1
+    systemctl restart docker 2>/dev/null || true
+    sleep 3
+
+    if systemctl is-active --quiet docker; then
+        ok "Docker service started after recovery"
+        return 0
+    fi
+
+    echo ""
+    warn "docker.service still failing — recent journal:"
+    rhel_docker_journal_tail | while read -r _line; do
+        [[ -n "$_line" ]] && detail "  $_line"
+    done
+    warn "Full log: journalctl -xeu docker.service"
+    return 1
+}
 
 # cgroupv2 + overlay2 — AlmaLinux and Ubuntu 22+ compatible
 apply_docker_daemon_config() {
@@ -734,6 +995,8 @@ install_docker_dnf() {
     dnf config-manager --add-repo "$DOCKER_DNF_REPO" -q
     ok "Repository configured"
 
+    prepare_docker_dnf_host
+
     info "Installing Docker CE + plugins..."
     dnf install -y -q \
         docker-ce docker-ce-cli containerd.io \
@@ -741,22 +1004,29 @@ install_docker_dnf() {
     ok "Docker packages installed"
 
     apply_docker_daemon_config
+    ensure_docker_running || true
+}
 
-    systemctl daemon-reload
-    systemctl enable --now docker
+install_docker_apk() {
+    enable_apk_community_repo
+    info "Installing Docker from Alpine repositories..."
+    apk add --no-cache docker docker-cli docker-cli-compose containerd
+    ok "Docker packages installed"
 
-    # Restart after daemon.json to ensure settings are applied
+    apply_docker_daemon_config
+
+    svc_enable_now docker
     sleep 2
-    if ! systemctl is-active --quiet docker; then
+    if ! svc_is_active docker; then
         warn "Docker not active after first start, restarting..."
-        systemctl restart docker
+        svc_restart docker
         sleep 3
     fi
 
-    if systemctl is-active --quiet docker; then
+    if svc_is_active docker; then
         ok "Docker service enabled & started"
     else
-        warn "Docker service may have issues — check: journalctl -xeu docker.service"
+        warn "Docker service may have issues — check: rc-service docker status"
     fi
 }
 
@@ -772,11 +1042,19 @@ upgrade_docker_dnf() {
         docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
 }
 
+upgrade_docker_apk() {
+    apk upgrade --available docker docker-cli docker-cli-compose containerd 2>/dev/null || true
+}
+
 if command -v docker &>/dev/null; then
-    OLD_VER=$(docker --version | grep -oP '\d+\.\d+\.\d+' | head -1)
+    OLD_VER=$(docker --version | extract_semver)
     info "docker found (${HACK_WARN}v${OLD_VER}${RESET}) — checking for upgrades..."
-    [[ "$PKG_MANAGER" == "apt" ]] && upgrade_docker_apt || upgrade_docker_dnf
-    NEW_VER=$(docker --version | grep -oP '\d+\.\d+\.\d+' | head -1)
+    case "$PKG_MANAGER" in
+        apt) upgrade_docker_apt ;;
+        apk) upgrade_docker_apk ;;
+        *)   upgrade_docker_dnf ;;
+    esac
+    NEW_VER=$(docker --version | extract_semver)
     if [[ "$OLD_VER" != "$NEW_VER" ]]; then
         ok "docker upgraded: ${HACK_WARN}v${OLD_VER}${RESET} → ${HACK}v${NEW_VER}${RESET}"
     else
@@ -785,15 +1063,26 @@ if command -v docker &>/dev/null; then
 
     if [[ ! -f /etc/docker/daemon.json ]]; then
         apply_docker_daemon_config
-        systemctl daemon-reload
-        systemctl restart docker
+        svc_daemon_reload
+        svc_restart docker
         sleep 2
         ok "daemon.json applied & Docker restarted"
     else
         skip "daemon.json already exists"
     fi
+
+    if ! docker info &>/dev/null 2>&1 && [[ "$PKG_MANAGER" == "dnf" ]]; then
+        warn "Docker daemon not responding — retrying with EL host recovery..."
+        prepare_docker_dnf_host
+        svc_daemon_reload
+        ensure_docker_running || true
+    fi
 else
-    [[ "$PKG_MANAGER" == "apt" ]] && install_docker_apt || install_docker_dnf
+    case "$PKG_MANAGER" in
+        apt) install_docker_apt ;;
+        apk) install_docker_apk ;;
+        *)   install_docker_dnf ;;
+    esac
 fi
 
 if docker compose version &>/dev/null 2>&1; then
@@ -816,12 +1105,12 @@ fi
 # ────────────────────────────────────────────────────────────────
 step 5 "$TOTAL_STEPS" "Timezone Configuration"
 
-CURRENT_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || echo "unknown")
+CURRENT_TZ=$(get_timezone)
 if [[ "$CURRENT_TZ" == "$TIMEZONE" ]]; then
     ok "Timezone already ${BGREEN}${TIMEZONE}${RESET}"
 else
     info "changing tz: ${HACK_WARN}${CURRENT_TZ}${RESET} → ${HACK}${TIMEZONE}${RESET}"
-    timedatectl set-timezone "$TIMEZONE"
+    set_system_timezone
     ok "Timezone set to ${BGREEN}${TIMEZONE}${RESET}"
 fi
 detail "Local time : $(date '+%A, %d %B %Y  %H:%M:%S %Z')"
@@ -946,14 +1235,18 @@ sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1 || true
 ok "Kernel tuned for DNS 53 (udp/tcp) + DoT 853"
 
 mkdir -p /etc/systemd/system.conf.d
-cat > "$SYSTEMD_DNS" << EOF
+if has_systemd; then
+    cat > "$SYSTEMD_DNS" << EOF
 # RAHMAT — systemd global limits (from .env)
 [Manager]
 DefaultLimitNOFILE=${LIMIT_NOFILE}:${LIMIT_NOFILE}
 DefaultLimitNPROC=${LIMIT_NPROC}:${LIMIT_NPROC}
 EOF
-systemctl daemon-reload 2>/dev/null || true
-ok "systemd limits → ${SYSTEMD_DNS}"
+    svc_daemon_reload
+    ok "systemd limits → ${SYSTEMD_DNS}"
+else
+    skip "systemd limits not applicable (OpenRC / non-systemd)"
+fi
 
 detail "Config file    : $SYSCTL_FILE"
 detail "UDP rmem_min   : $(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || echo n/a)"
@@ -1023,6 +1316,60 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
     echo ""
     firewall-cmd --reload > /dev/null 2>&1
     ok "firewalld ${BGREEN}reloaded & active${RESET}"
+
+elif [[ "$PKG_MANAGER" == "apk" ]]; then
+    ALPINE_FW="/etc/rahmat/apply-alpine-firewall.sh"
+    info "Configuring Alpine iptables firewall..."
+    command -v iptables &>/dev/null || apk add --no-cache iptables ip6tables iptables-legacy
+    mkdir -p /etc/rahmat /etc/iptables
+
+    cat > "$ALPINE_FW" << 'EOFALPINE'
+#!/bin/sh
+# RAHMAT — Alpine base iptables (DDoS chain applied separately)
+set -e
+IPT="${IPTABLES:-iptables}"
+
+$IPT -P INPUT DROP
+$IPT -P FORWARD DROP
+$IPT -P OUTPUT ACCEPT
+
+$IPT -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    $IPT -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+$IPT -C INPUT -i lo -j ACCEPT 2>/dev/null || $IPT -A INPUT -i lo -j ACCEPT
+
+for _spec in "53 udp" "53 tcp" "853 tcp" "80 tcp" "443 tcp"; do
+    _p="${_spec%% *}"
+    _pr="${_spec##* }"
+    $IPT -C INPUT -p "$_pr" --dport "$_p" -j ACCEPT 2>/dev/null || \
+        $IPT -A INPUT -p "$_pr" --dport "$_p" -j ACCEPT
+done
+
+$IPT -C INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --name SSH --set 2>/dev/null || \
+    $IPT -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --name SSH --set
+$IPT -C INPUT -p tcp --dport 22 -m recent --name SSH --update --seconds 60 --hitcount 4 -j DROP 2>/dev/null || \
+    $IPT -A INPUT -p tcp --dport 22 -m recent --name SSH --update --seconds 60 --hitcount 4 -j DROP
+$IPT -C INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || \
+    $IPT -A INPUT -p tcp --dport 22 -j ACCEPT
+
+$IPT -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null || \
+    $IPT -A INPUT -p icmp --icmp-type echo-request -j DROP
+EOFALPINE
+    chmod +x "$ALPINE_FW"
+    sh "$ALPINE_FW"
+    iptables-save > /etc/iptables/rules-save 2>/dev/null || true
+    rc-update add iptables-legacy boot 2>/dev/null || rc-update add iptables boot 2>/dev/null || true
+
+    ok "Default policy → ${BRED}DENY${RESET} incoming / ${BGREEN}ALLOW${RESET} outgoing"
+    echo ""
+    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}53${RESET}/${HACK}UDP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}DNS — Plain UDP (primary)${RESET}"
+    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}53${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}DNS — Plain TCP (fallback)${RESET}"
+    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}853${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}DoT — DNS-over-TLS${RESET}"
+    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}22${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}SSH — rate limited (DDoS)${RESET}"
+    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}80${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}HTTP — ACME / Certificate Renewal${RESET}"
+    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}443${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}HTTPS — DoH (DNS-over-HTTPS)${RESET}"
+    ok "ICMP ping blocked (iptables + sysctl)"
+    echo ""
+    ok "Alpine iptables firewall ${BGREEN}active${RESET}"
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -1060,7 +1407,7 @@ detail "DoH 443 limit : ${DOH_RATE}/IP"
 detail "SYN global    : ${SYN_RATE} (burst ${SYN_BURST})"
 detail "SYN cookies   : $(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null || echo 1)"
 detail "Tune all      : edit ${ENV_FILE} or /etc/rahmat/.env → re-run setup.sh"
-detail "DDoS reload   : systemctl restart rahmat-ddos"
+detail "DDoS reload   : $(has_systemd && echo 'systemctl restart rahmat-ddos' || echo '/etc/rahmat/apply-ddos-rules.sh')"
 
 # ────────────────────────────────────────────────────────────────
 # STEP 10 — SSH Hardening, Keys & IP Whitelist
@@ -1134,6 +1481,15 @@ if [[ ${#SSH_WHITELIST[@]} -gt 0 ]]; then
             ufw allow from "$ip" to any port 22 proto tcp > /dev/null
             detail "UFW allow SSH from $ip"
         done
+    elif [[ "$PKG_MANAGER" == "apk" ]]; then
+        iptables -D INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p tcp --dport 22 -m recent --name SSH --update --seconds 60 --hitcount 4 -j DROP 2>/dev/null || true
+        iptables -D INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --name SSH --set 2>/dev/null || true
+        for ip in "${SSH_WHITELIST[@]}"; do
+            iptables -I INPUT -p tcp -s "$ip" --dport 22 -j ACCEPT
+            detail "iptables allow SSH from $ip"
+        done
+        iptables-save > /etc/iptables/rules-save 2>/dev/null || true
     else
         firewall-cmd --permanent --remove-port=22/tcp > /dev/null 2>&1 || true
         for ip in "${SSH_WHITELIST[@]}"; do
@@ -1196,10 +1552,13 @@ mkdir -p /etc/fail2ban/jail.d
 
 if [[ "$PKG_MANAGER" == "apt" ]]; then
     F2B_BANACTION="ufw"
+    F2B_BACKEND="systemd"
 elif [[ "$PKG_MANAGER" == "dnf" ]]; then
     F2B_BANACTION="firewallcmd-rich-rules"
+    F2B_BACKEND="systemd"
 else
     F2B_BANACTION="iptables-multiport"
+    F2B_BACKEND="auto"
 fi
 
 cat > "$F2B_JAIL" << EOF
@@ -1209,7 +1568,7 @@ bantime  = ${F2B_DEFAULT_BANTIME}
 findtime = ${F2B_DEFAULT_FINDTIME}
 maxretry = ${F2B_DEFAULT_MAXRETRY}
 banaction = ${F2B_BANACTION}
-backend = systemd
+backend = ${F2B_BACKEND}
 
 [sshd]
 enabled  = true
@@ -1229,8 +1588,8 @@ bantime  = ${F2B_RECIDIVE_BANTIME}
 findtime = ${F2B_RECIDIVE_FINDTIME}
 EOF
 
-systemctl enable fail2ban > /dev/null 2>&1
-systemctl restart fail2ban > /dev/null 2>&1
+svc_enable_now fail2ban
+svc_restart fail2ban
 ok "Fail2Ban jails configured → ${F2B_JAIL}"
 detail "sshd bantime  : 24h (86400s)"
 detail "recidive      : 7d ban on repeat offenders"
@@ -1303,6 +1662,18 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
     ok "dnf-automatic timer enabled (AlmaLinux/RHEL)"
     detail "Config : /etc/dnf/automatic.conf"
     detail "Type   : security updates only"
+
+elif [[ "$PKG_MANAGER" == "apk" ]]; then
+    command -v crond &>/dev/null || apk add --no-cache dcron
+    cat > /etc/cron.d/rahmat-apk-upgrade << 'EOF'
+# RAHMAT — daily Alpine security updates
+0 3 * * * root /sbin/apk update && /sbin/apk upgrade --available
+EOF
+    chmod 644 /etc/cron.d/rahmat-apk-upgrade
+    svc_enable_now crond
+    ok "apk daily upgrade cron enabled (Alpine)"
+    detail "Config : /etc/cron.d/rahmat-apk-upgrade"
+    detail "Schedule: 03:00 daily"
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -1341,6 +1712,17 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
         systemctl disable --now systemd-resolved
         ok "systemd-resolved stopped"
     fi
+
+elif [[ "$PKG_MANAGER" == "apk" ]]; then
+    for svc in unbound named bind dnsmasq; do
+        if svc_is_active "$svc"; then
+            info "Stopping $svc..."
+            svc_disable_now "$svc"
+            ok "$svc ${BRED}stopped & disabled${RESET}"
+        else
+            ok "$svc — already inactive"
+        fi
+    done
 fi
 
 if [[ -L /etc/resolv.conf ]]; then
@@ -1383,7 +1765,7 @@ echo -e "  ${HACK}║${RESET}  OS         ${HACK_DIM}:${RESET}  ${BWHITE}${PRETT
 echo -e "  ${HACK}║${RESET}  Kernel     ${HACK_DIM}:${RESET}  ${BWHITE}$(uname -r)${RESET}"
 echo -e "  ${HACK}║${RESET}  Arch       ${HACK_DIM}:${RESET}  ${BWHITE}$(uname -m)${RESET}"
 echo -e "  ${HACK}║${RESET}  Family     ${HACK_DIM}:${RESET}  ${BWHITE}${OS_FAMILY} (${PKG_MANAGER})${RESET}"
-echo -e "  ${HACK}║${RESET}  Timezone   ${HACK_DIM}:${RESET}  ${BWHITE}$(timedatectl show -p Timezone --value)${RESET}  ${HACK_DIM}@ $(date '+%H:%M:%S')${RESET}"
+echo -e "  ${HACK}║${RESET}  Timezone   ${HACK_DIM}:${RESET}  ${BWHITE}$(get_timezone)${RESET}  ${HACK_DIM}@ $(date '+%H:%M:%S')${RESET}"
 echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
 echo ""
 
@@ -1402,13 +1784,13 @@ else
 fi
 
 if command -v make &>/dev/null; then
-    _row "${HACK}[+]${RESET}" "make" "v$(make --version | head -1 | grep -oP '\d+\.\d+(\.\d+)?')"
+    _row "${HACK}[+]${RESET}" "make" "v$(make --version | head -1 | extract_version_short)"
 else
     _row "${HACK_ERR}[x]${RESET}" "make" "not found"
 fi
 
 if command -v docker &>/dev/null; then
-    _row "${HACK}[+]${RESET}" "docker" "v$(docker --version | grep -oP '\d+\.\d+\.\d+' | head -1)"
+    _row "${HACK}[+]${RESET}" "docker" "v$(docker --version | extract_semver)"
 else
     _row "${HACK_ERR}[x]${RESET}" "docker" "not found"
 fi
@@ -1420,7 +1802,7 @@ else
 fi
 
 if command -v fail2ban-client &>/dev/null; then
-    _row "${HACK}[+]${RESET}" "fail2ban" "v$(fail2ban-client --version 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1)"
+    _row "${HACK}[+]${RESET}" "fail2ban" "v$(fail2ban-client --version 2>&1 | extract_semver)"
 else
     _row "${HACK_ERR}[x]${RESET}" "fail2ban" "not found"
 fi
@@ -1461,7 +1843,7 @@ else
 fi
 echo -e "  ${HACK}║${RESET}  Fail2Ban      ${HACK_DIM}:${RESET}  ${F2B_JAIL:-/etc/fail2ban/jail.d/rahmat.local}"
 echo -e "  ${HACK}║${RESET}  DDoS rules    ${HACK_DIM}:${RESET}  ${DDOS_SCRIPT:-/etc/rahmat/apply-ddos-rules.sh}"
-echo -e "  ${HACK}║${RESET}  DDoS service  ${HACK_DIM}:${RESET}  rahmat-ddos.service"
+echo -e "  ${HACK}║${RESET}  DDoS service  ${HACK_DIM}:${RESET}  $(has_systemd && echo 'rahmat-ddos.service' || echo 'rahmat-network.start (OpenRC)')"
 echo -e "  ${HACK}║${RESET}  SYN cookies   ${HACK_DIM}:${RESET}  $(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null || echo n/a)"
 echo -e "  ${HACK}║${RESET}  DNS UDP cap   ${HACK_DIM}:${RESET}  300 qps/IP · burst 600"
 echo -e "  ${HACK}║${RESET}  DoT 853 cap   ${HACK_DIM}:${RESET}  ${DOT_RATE}/IP · burst ${DOT_BURST} · max ${DOT_CONN_MAX} conn"
@@ -1476,6 +1858,9 @@ echo ""
 if [[ "$PKG_MANAGER" == "apt" ]]; then
     FW_NAME="UFW"
     FW_STATE=$(ufw status | head -1 | awk '{print $NF}')
+elif [[ "$PKG_MANAGER" == "apk" ]]; then
+    FW_NAME="iptables"
+    FW_STATE=$(iptables -L INPUT -n 2>/dev/null | head -1 | grep -qi policy && echo "active" || echo "unknown")
 else
     FW_NAME="firewalld"
     FW_STATE=$(systemctl is-active firewalld 2>/dev/null || echo "unknown")
@@ -1521,6 +1906,17 @@ if [[ "$OS_FAMILY" == "rhel" ]]; then
         echo -e "  ${HACK}║${RESET}  EPEL repo   ${HACK_DIM}:${RESET}  ${HACK}enabled${RESET}"
     fi
     echo -e "  ${HACK}║${RESET}  Docker src  ${HACK_DIM}:${RESET}  ${DOCKER_DNF_REPO#https://}"
+    echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
+    echo ""
+fi
+
+if [[ "$OS_FAMILY" == "alpine" ]]; then
+    echo -e "  ${HACK}╔══[ALP] ALPINE LINUX NOTES ═══════════════════════╗${RESET}"
+    echo -e "  ${HACK}║${RESET}  Distro      ${HACK_DIM}:${RESET}  ${OS_DISPLAY}"
+    echo -e "  ${HACK}║${RESET}  Init        ${HACK_DIM}:${RESET}  $(has_systemd && echo systemd || echo OpenRC)"
+    echo -e "  ${HACK}║${RESET}  Firewall    ${HACK_DIM}:${RESET}  iptables (/etc/rahmat/apply-alpine-firewall.sh)"
+    echo -e "  ${HACK}║${RESET}  Docker      ${HACK_DIM}:${RESET}  apk (cgroupfs driver)"
+    echo -e "  ${HACK}║${RESET}  DDoS boot   ${HACK_DIM}:${RESET}  /etc/local.d/rahmat-network.start"
     echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
     echo ""
 fi
