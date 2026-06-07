@@ -5,7 +5,7 @@
 #             Rocky · RHEL · CentOS Stream · Fedora (latest) | Alpine Linux 3.x+
 #  Author   : RAHMAT
 #  GitHub   : https://github.com/zamibd/setup/setup.sh
-#  Version  : 2.8.8
+#  Version  : 2.9.0
 # ================================================================
 
 # Re-exec with bash when invoked via ash/sh (Alpine: `sh setup.sh` after download)
@@ -293,8 +293,28 @@ alpine_is_virt_kernel() {
     uname -r | grep -qE '\-virt$'
 }
 
+alpine_is_lts_kernel() {
+    uname -r | grep -qE '\-lts$'
+}
+
+ALPINE_LTS_BOOT_DONE="${ALPINE_LTS_BOOT_DONE:-false}"
+
+alpine_lts_initramfs_ready() {
+    local _kver="$1"
+    [[ -f "/boot/initramfs-${_kver}" ]] || [[ -e /boot/initramfs-lts ]]
+}
+
 alpine_lts_kernel_version() {
     ls -1 /lib/modules 2>/dev/null | grep -E '\-lts$' | sort -V | tail -1
+}
+
+alpine_ensure_lts_initramfs() {
+    local _lts_kver="$1"
+    command -v mkinitfs &>/dev/null || return 0
+    alpine_lts_initramfs_ready "$_lts_kver" && return 0
+    mkinitfs -F lts >/dev/null 2>&1 || \
+        mkinitfs -b /boot "$_lts_kver" >/dev/null 2>&1 || \
+        mkinitfs >/dev/null 2>&1 || true
 }
 
 alpine_update_bootloader_config() {
@@ -303,55 +323,64 @@ alpine_update_bootloader_config() {
     local _entry _sub
 
     [[ -f /boot/vmlinuz-lts ]] && ln -sf vmlinuz-lts /boot/vmlinuz 2>/dev/null || true
-    if [[ -n "$_lts_kver" && -f "/boot/initramfs-${_lts_kver}" ]]; then
+    if [[ -e /boot/initramfs-lts ]]; then
+        ln -sf initramfs-lts /boot/initramfs 2>/dev/null || true
+    elif [[ -n "$_lts_kver" && -f "/boot/initramfs-${_lts_kver}" ]]; then
         ln -sf "initramfs-${_lts_kver}" /boot/initramfs 2>/dev/null || true
         ln -sf "initramfs-${_lts_kver}" /boot/initramfs-lts 2>/dev/null || true
     fi
 
+    # extlinux: Alpine uses default=lts in /etc/update-extlinux.conf (not DEFAULT in extlinux.conf)
     if [[ -f /etc/update-extlinux.conf ]]; then
-        grep -q '^DEFAULT ' /etc/update-extlinux.conf 2>/dev/null && \
-            sed -i 's/^DEFAULT .*/DEFAULT lts/' /etc/update-extlinux.conf || \
-            echo 'DEFAULT lts' >> /etc/update-extlinux.conf
+        if grep -qE '^default=' /etc/update-extlinux.conf 2>/dev/null; then
+            sed -i 's/^default=.*/default=lts/' /etc/update-extlinux.conf
+        else
+            echo 'default=lts' >> /etc/update-extlinux.conf
+        fi
+        command -v update-extlinux &>/dev/null && update-extlinux >/dev/null 2>&1 || true
     fi
-    if [[ -f /boot/extlinux.conf ]]; then
-        grep -q '^DEFAULT ' /boot/extlinux.conf 2>/dev/null && \
-            sed -i 's/^DEFAULT .*/DEFAULT lts/' /boot/extlinux.conf || \
-            sed -i '1i DEFAULT lts' /boot/extlinux.conf
-    fi
-    command -v update-extlinux &>/dev/null && update-extlinux >/dev/null 2>&1 || true
 
     if [[ -f /etc/default/grub ]]; then
+        grep -q '^GRUB_SAVEDEFAULT=' /etc/default/grub 2>/dev/null || \
+            echo 'GRUB_SAVEDEFAULT=true' >> /etc/default/grub
+        sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub 2>/dev/null || \
+            echo 'GRUB_DEFAULT=saved' >> /etc/default/grub
         grep -q '^GRUB_TOP_LEVEL=' /etc/default/grub 2>/dev/null && \
             sed -i 's|^GRUB_TOP_LEVEL=.*|GRUB_TOP_LEVEL=/boot/vmlinuz-lts|' /etc/default/grub || \
             echo 'GRUB_TOP_LEVEL=/boot/vmlinuz-lts' >> /etc/default/grub
-        sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=0/' /etc/default/grub 2>/dev/null || \
-            echo 'GRUB_DEFAULT=0' >> /etc/default/grub
+    fi
+
+    if [[ -d /boot/grub ]] && ! command -v grub-mkconfig &>/dev/null; then
+        apk add --no-cache grub 2>/dev/null || true
     fi
 
     if command -v grub-mkconfig &>/dev/null && [[ -d /boot/grub ]]; then
+        [[ ! -f /boot/grub/grubenv ]] && command -v grub-editenv &>/dev/null && \
+            grub-editenv /boot/grub/grubenv create 2>/dev/null || true
         grub-mkconfig -o "$_grub_cfg" >/dev/null 2>&1 || true
     elif command -v update-grub &>/dev/null; then
         update-grub >/dev/null 2>&1 || true
     fi
 
     if command -v grub-set-default &>/dev/null && [[ -f "$_grub_cfg" ]]; then
-        _entry=$(grep -E 'menuentry ' "$_grub_cfg" | grep -i lts | head -1 | sed -n "s/.*menuentry '\([^']*\)'.*/\1/p")
-        if [[ -n "$_entry" ]]; then
-            grub-set-default "$_entry" >/dev/null 2>&1 || true
-            detail "GRUB default → ${_entry}"
-        else
-            grub-set-default 0 >/dev/null 2>&1 || true
-        fi
         _sub=$(grep -E 'submenu ' "$_grub_cfg" | head -1 | sed -n "s/.*submenu '\([^']*\)'.*/\1/p")
         _entry=$(grep -E 'menuentry ' "$_grub_cfg" | grep -i lts | head -1 | sed -n "s/.*menuentry '\([^']*\)'.*/\1/p")
         if [[ -n "$_sub" && -n "$_entry" ]]; then
             grub-set-default "${_sub}>${_entry}" >/dev/null 2>&1 || true
+            detail "GRUB default → ${_sub} > ${_entry}"
+        elif [[ -n "$_entry" ]]; then
+            grub-set-default "$_entry" >/dev/null 2>&1 || true
+            detail "GRUB default → ${_entry}"
+        else
+            grub-set-default 0 >/dev/null 2>&1 || true
         fi
     fi
 }
 
 alpine_activate_lts_boot() {
     local _lts_kver
+
+    [[ "$ALPINE_LTS_BOOT_DONE" == "true" ]] && return 0
 
     alpine_ensure_linux_lts || return 1
     _lts_kver=$(alpine_lts_kernel_version)
@@ -361,20 +390,18 @@ alpine_activate_lts_boot() {
     fi
 
     info "Activating linux-lts boot (${_lts_kver})..."
-    command -v mkinitfs &>/dev/null && [[ ! -f "/boot/initramfs-${_lts_kver}" ]] && \
-        mkinitfs -b /boot "$_lts_kver" >/dev/null 2>&1 || true
-
+    alpine_ensure_lts_initramfs "$_lts_kver"
     alpine_update_bootloader_config "$_lts_kver"
 
-    # GRUB often keeps booting linux-virt while both packages are installed
-    if apk info -e linux-virt &>/dev/null && [[ -f /boot/vmlinuz-lts ]] && \
-        [[ -f "/boot/initramfs-${_lts_kver}" ]]; then
+    # GRUB/extlinux often keeps booting linux-virt while both packages are installed
+    if apk info -e linux-virt &>/dev/null && [[ -f /boot/vmlinuz-lts ]]; then
         info "Removing linux-virt so bootloader uses linux-lts..."
         apk del linux-virt linux-virt-openrc 2>/dev/null || true
         alpine_update_bootloader_config "$_lts_kver"
     fi
 
     ALPINE_NEEDS_REBOOT=true
+    ALPINE_LTS_BOOT_DONE=true
     ok "linux-lts boot configured (${_lts_kver}) — reboot required"
     return 0
 }
@@ -397,16 +424,33 @@ alpine_reboot_gate() {
     [[ "$OS_FAMILY" == "alpine" ]] || return 0
     [[ "$ALPINE_NETFILTER_OK" == "true" ]] && return 0
 
-    if [[ "$ALPINE_NEEDS_REBOOT" == "true" ]] || \
-        { alpine_is_virt_kernel && ! alpine_netfilter_works; }; then
-        alpine_activate_lts_boot 2>/dev/null || alpine_ensure_linux_lts || true
+    if alpine_is_virt_kernel || \
+        { [[ "$ALPINE_NEEDS_REBOOT" == "true" ]] && ! alpine_netfilter_works 2>/dev/null; }; then
+        if alpine_is_virt_kernel && [[ "$ALPINE_LTS_BOOT_DONE" != "true" ]]; then
+            alpine_activate_lts_boot 2>/dev/null || alpine_ensure_linux_lts || true
+        fi
         echo ""
-        echo -e "  ${HACK_ERR}[!]${RESET} ${BOLD}REBOOT REQUIRED — switch from linux-virt to linux-lts${RESET}"
-        echo -e "  ${HACK}Kernel now${RESET} : $(uname -r)"
-        echo -e "  ${HACK}Cause${RESET}     : linux-virt has no ip_tables (iptables/Docker impossible)"
-        echo -e "  ${HACK}Action${RESET}    : installer configured ${BOLD}linux-lts${RESET} as boot kernel"
+        if alpine_is_virt_kernel; then
+            echo -e "  ${HACK_ERR}[!]${RESET} ${BOLD}REBOOT REQUIRED — switch from linux-virt to linux-lts${RESET}"
+            echo -e "  ${HACK}Kernel now${RESET} : $(uname -r)"
+            echo -e "  ${HACK}Cause${RESET}     : linux-virt has no ip_tables (iptables/Docker impossible)"
+            echo -e "  ${HACK}Action${RESET}    : installer configured ${BOLD}linux-lts${RESET} as boot kernel"
+            if apk info -e linux-virt &>/dev/null 2>&1; then
+                echo -e "  ${HACK}Manual${RESET}    : ${BOLD}apk del linux-virt && reboot${RESET}  ${HACK_DIM}(if still virt after reboot)${RESET}"
+            fi
+            if [[ -f /etc/update-extlinux.conf ]]; then
+                echo -e "  ${HACK}Bootloader${RESET} : extlinux — ${HACK_DIM}default=lts in /etc/update-extlinux.conf${RESET}"
+            elif [[ -d /boot/grub ]]; then
+                echo -e "  ${HACK}Bootloader${RESET} : GRUB — ${HACK_DIM}grub-set-default → linux-lts entry${RESET}"
+            fi
+        else
+            echo -e "  ${HACK_ERR}[!]${RESET} ${BOLD}REBOOT REQUIRED — new kernel installed${RESET}"
+            echo -e "  ${HACK}Kernel now${RESET} : $(uname -r)"
+            echo -e "  ${HACK}Cause${RESET}     : newer kernel with netfilter modules is installed but not running"
+        fi
         echo -e "  ${HACK}Fix${RESET}       : ${BOLD}reboot${RESET}"
         echo -e "  ${HACK}Verify${RESET}    : ${BOLD}uname -r${RESET} must show ${BOLD}...-lts${RESET} (not ...-virt)"
+        echo -e "  ${HACK}Check${RESET}     : ${BOLD}iptables-legacy -L -n${RESET} must succeed after reboot"
         echo -e "  ${HACK}Then${RESET}      : ${BOLD}bash setup.sh${RESET}"
         echo ""
         exit 0
@@ -428,7 +472,30 @@ alpine_kernel_has_ip_tables_module() {
         "/lib/modules/${_kver}/kernel/net/ipv4/netfilter/ip_tables.ko"; do
         [[ -f "$_f" ]] && return 0
     done
+    if [[ -f "/lib/modules/${_kver}/modules.builtin" ]] && \
+        grep -qE '(^|/)ip_tables(\.ko)?$' "/lib/modules/${_kver}/modules.builtin" 2>/dev/null; then
+        return 0
+    fi
     return 1
+}
+
+alpine_load_netfilter_modules() {
+    cat > /etc/modules-load.d/rahmat-netfilter.conf << 'EOF'
+ip_tables
+ip6_tables
+nf_conntrack
+xt_conntrack
+xt_recent
+xt_hashlimit
+xt_connlimit
+br_netfilter
+overlay
+EOF
+    local _m
+    for _m in ip_tables ip6_tables nf_conntrack xt_conntrack \
+        xt_recent xt_hashlimit xt_connlimit br_netfilter overlay; do
+        modprobe "$_m" >/dev/null 2>&1 || true
+    done
 }
 
 alpine_fix_kernel_netfilter() {
@@ -452,38 +519,29 @@ alpine_fix_kernel_netfilter() {
         return 0
     fi
 
-    # linux-virt: no ip_tables module — must use linux-lts kernel
-    if alpine_is_virt_kernel || ! alpine_kernel_has_ip_tables_module "$_running"; then
-        warn "ip_tables unavailable on kernel ${_running}"
+    # linux-virt: no ip_tables — must switch to linux-lts and reboot
+    if alpine_is_virt_kernel; then
+        warn "ip_tables unavailable on linux-virt (${_running})"
         alpine_activate_lts_boot || alpine_ensure_linux_lts || true
         ALPINE_NEEDS_REBOOT=true
-        warn "REBOOT required — must boot linux-lts (check: uname -r ends with -lts)"
         return 0
     fi
 
-    if alpine_kernel_has_ip_tables_module "$_running"; then
-        cat > /etc/modules-load.d/rahmat-netfilter.conf << 'EOF'
-ip_tables
-ip6_tables
-nf_conntrack
-xt_conntrack
-xt_recent
-xt_hashlimit
-xt_connlimit
-br_netfilter
-overlay
-EOF
-        modprobe ip_tables >/dev/null 2>&1 || true
-        modprobe ip6_tables >/dev/null 2>&1 || true
-        if alpine_netfilter_works; then
-            ALPINE_NETFILTER_OK=true
-            return 0
-        fi
+    alpine_load_netfilter_modules
+    if alpine_netfilter_works; then
+        ALPINE_NETFILTER_OK=true
+        return 0
     fi
 
-    alpine_activate_lts_boot || alpine_ensure_linux_lts || true
-    ALPINE_NEEDS_REBOOT=true
-    warn "REBOOT required — must boot linux-lts before iptables/Docker will work"
+    # Non-virt kernel without working netfilter — try linux-lts if not already on it
+    if ! alpine_is_lts_kernel; then
+        warn "ip_tables unavailable on kernel ${_running}"
+        alpine_activate_lts_boot || alpine_ensure_linux_lts || true
+        ALPINE_NEEDS_REBOOT=true
+        return 0
+    fi
+
+    warn "ip_tables still unavailable on ${_running} — try: modprobe ip_tables; iptables-legacy -L -n"
 }
 
 alpine_force_iptables_legacy() {
@@ -793,7 +851,7 @@ banner() {
     echo -e "${HACK_DIM}[!] initialising payload...${RESET}"
     echo -e "${HACK}${BOLD}"
     echo '  ┌──────────────────────────────────────────────────────────┐'
-    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.8.8          │'
+    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.9.0          │'
     echo '  ├──────────────────────────────────────────────────────────┤'
     echo '  │                                                          │'
     echo '  │   ####    ###   #   #  ## ##   ###   #####              │'
@@ -807,7 +865,7 @@ banner() {
     echo -e "${RESET}"
     echo -e "  ${HACK}[root@rahmat:~#]${RESET} ${HACK_DIM}./setup.sh --deploy-dns${RESET}"
     echo -e "  ${HACK_MUTED}[$]${RESET} ${GREEN}${GITHUB_URL}${RESET}"
-    echo -e "  ${HACK_MUTED}[#]${RESET} ${HACK_DIM}ubuntu | debian | almalinux | rocky | rhel | fedora${RESET}"
+    echo -e "  ${HACK_MUTED}[#]${RESET} ${HACK_DIM}ubuntu | debian | almalinux | rocky | rhel | fedora | alpine${RESET}"
     echo ""
     echo -e "  ${HACK_MUTED}$(printf '%.0s=' {1..58})${RESET}"
     echo ""
@@ -1096,10 +1154,6 @@ elif [[ "$PKG_MANAGER" == "apk" ]]; then
     info "Running apk upgrade (this may take a while)..."
     apk upgrade -a
     ok "System packages upgraded successfully"
-    if alpine_is_virt_kernel && ! alpine_netfilter_works 2>/dev/null; then
-        alpine_activate_lts_boot || true
-        ALPINE_NEEDS_REBOOT=true
-    fi
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -1174,6 +1228,14 @@ elif [[ "$PKG_MANAGER" == "apk" ]]; then
             TO_INSTALL+=("$pkg")
         fi
     done
+    if alpine_is_virt_kernel && ! apk info -e linux-lts &>/dev/null; then
+        for _lts_pkg in linux-lts linux-lts-openrc; do
+            if ! apk info -e "$_lts_pkg" &>/dev/null; then
+                info "queued: ${HACK_WARN}${_lts_pkg}${RESET} ${HACK_DIM}(replace linux-virt for netfilter)${RESET}"
+                TO_INSTALL+=("$_lts_pkg")
+            fi
+        done
+    fi
     if [[ ${#TO_INSTALL[@]} -gt 0 ]]; then
         echo ""
         info "installing ${HACK_WARN}${#TO_INSTALL[@]}${RESET} package(s)..."
@@ -1190,6 +1252,8 @@ fi
 # STEP 4 — Docker & Docker Compose
 # ────────────────────────────────────────────────────────────────
 step 4 "$TOTAL_STEPS" "Docker Engine & Docker Compose"
+
+[[ "$OS_FAMILY" == "alpine" ]] && alpine_reboot_gate
 
 rhel_docker_journal_tail() {
     journalctl -u docker.service -n 20 --no-pager 2>/dev/null | tail -10 || true
@@ -1954,6 +2018,15 @@ else
     F2B_BACKEND="auto"
 fi
 
+F2B_LOGPATH="/var/log/auth.log"
+if [[ "$PKG_MANAGER" == "apk" ]]; then
+    if [[ -f /var/log/messages ]]; then
+        F2B_LOGPATH="/var/log/messages"
+    elif [[ -f /var/log/auth.log ]]; then
+        F2B_LOGPATH="/var/log/auth.log"
+    fi
+fi
+
 cat > "$F2B_JAIL" << EOF
 # RAHMAT — Fail2Ban jails (from .env)
 [DEFAULT]
@@ -1967,6 +2040,7 @@ backend = ${F2B_BACKEND}
 enabled  = true
 port     = ssh
 filter   = sshd
+logpath  = ${F2B_LOGPATH}
 mode     = ${F2B_SSHD_MODE}
 maxretry = ${F2B_SSHD_MAXRETRY}
 bantime  = ${F2B_SSHD_BANTIME}
