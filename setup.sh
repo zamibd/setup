@@ -5,8 +5,24 @@
 #             Rocky · RHEL · CentOS Stream · Fedora (latest) | Alpine Linux 3.x+
 #  Author   : RAHMAT
 #  GitHub   : https://github.com/zamibd/setup/setup.sh
-#  Version  : 2.8.2
+#  Version  : 2.8.3
 # ================================================================
+
+# Re-exec with bash when invoked via ash/sh (Alpine: `sh setup.sh` after download)
+if [ -z "${BASH_VERSION:-}" ]; then
+    _rahmat_sh="$0"
+    if [ -r /etc/alpine-release ] && command -v apk >/dev/null 2>&1; then
+        apk add --no-cache bash >/dev/null 2>&1 || apk add bash >/dev/null 2>&1 || true
+    fi
+    if [ -x /bin/bash ] && [ -f "$_rahmat_sh" ]; then
+        exec /bin/bash "$_rahmat_sh" "$@"
+    fi
+    printf '%s\n' \
+        'ERROR: bash is required to run this installer.' \
+        'Alpine:  apk add bash && bash setup.sh' \
+        'Others:  bash setup.sh   (or: sudo bash setup.sh)' >&2
+    exit 1
+fi
 
 set -euo pipefail
 
@@ -529,7 +545,7 @@ banner() {
     echo -e "${HACK_DIM}[!] initialising payload...${RESET}"
     echo -e "${HACK}${BOLD}"
     echo '  ┌──────────────────────────────────────────────────────────┐'
-    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.8.2          │'
+    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.8.3          │'
     echo '  ├──────────────────────────────────────────────────────────┤'
     echo '  │                                                          │'
     echo '  │   ####    ###   #   #  ## ##   ###   #####              │'
