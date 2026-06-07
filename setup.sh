@@ -5,7 +5,7 @@
 #             Rocky · RHEL · CentOS Stream · Fedora (latest) | Alpine Linux 3.x+
 #  Author   : RAHMAT
 #  GitHub   : https://github.com/zamibd/setup/setup.sh
-#  Version  : 2.8.6
+#  Version  : 2.8.7
 # ================================================================
 
 # Re-exec with bash when invoked via ash/sh (Alpine: `sh setup.sh` after download)
@@ -289,6 +289,42 @@ ALPINE_IP6T="${ALPINE_IP6T:-ip6tables-legacy}"
 ALPINE_NEEDS_REBOOT="${ALPINE_NEEDS_REBOOT:-false}"
 ALPINE_NETFILTER_OK="${ALPINE_NETFILTER_OK:-false}"
 
+alpine_is_virt_kernel() {
+    uname -r | grep -qE '\-virt$'
+}
+
+alpine_ensure_linux_lts() {
+    if apk info -e linux-lts &>/dev/null; then
+        return 0
+    fi
+    info "Installing linux-lts (required for iptables/Docker — linux-virt has no ip_tables)..."
+    apk add --no-cache linux-lts linux-lts-openrc 2>/dev/null || \
+        apk add --no-cache linux-lts 2>/dev/null || {
+        warn "Could not install linux-lts — run: apk add linux-lts"
+        return 1
+    }
+    ok "linux-lts installed"
+    return 0
+}
+
+alpine_reboot_gate() {
+    [[ "$OS_FAMILY" == "alpine" ]] || return 0
+    [[ "$ALPINE_NETFILTER_OK" == "true" ]] && return 0
+
+    if [[ "$ALPINE_NEEDS_REBOOT" == "true" ]] || \
+        { alpine_is_virt_kernel && ! alpine_netfilter_works; }; then
+        alpine_ensure_linux_lts 2>/dev/null || true
+        echo ""
+        echo -e "  ${HACK_ERR}[!]${RESET} ${BOLD}REBOOT REQUIRED — Alpine linux-virt cannot run iptables/Docker${RESET}"
+        echo -e "  ${HACK}Kernel now${RESET} : $(uname -r)"
+        echo -e "  ${HACK}Cause${RESET}     : linux-virt has no ip_tables module"
+        echo -e "  ${HACK}Fix${RESET}       : ${BOLD}reboot${RESET}  ${HACK_DIM}(boots linux-lts)${RESET}"
+        echo -e "  ${HACK}Then${RESET}      : ${BOLD}bash setup.sh${RESET}  ${HACK_DIM}(completes firewall/Docker/DDoS)${RESET}"
+        echo ""
+        exit 0
+    fi
+}
+
 alpine_netfilter_works() {
     local _ipt="${1:-${ALPINE_IPT:-iptables-legacy}}"
     command -v "$_ipt" >/dev/null 2>&1 || return 1
@@ -328,6 +364,15 @@ alpine_fix_kernel_netfilter() {
         return 0
     fi
 
+    # linux-virt: no ip_tables module — must use linux-lts kernel
+    if alpine_is_virt_kernel || ! alpine_kernel_has_ip_tables_module "$_running"; then
+        warn "ip_tables unavailable on kernel ${_running}"
+        alpine_ensure_linux_lts || true
+        ALPINE_NEEDS_REBOOT=true
+        warn "REBOOT required — boot linux-lts before iptables/Docker will work"
+        return 0
+    fi
+
     if alpine_kernel_has_ip_tables_module "$_running"; then
         cat > /etc/modules-load.d/rahmat-netfilter.conf << 'EOF'
 ip_tables
@@ -348,19 +393,9 @@ EOF
         fi
     fi
 
-    # linux-virt often ships without ip_tables — Docker/firewall need linux-lts
-    warn "ip_tables missing for kernel ${_running} (linux-virt is too minimal for iptables/Docker)"
-    if apk info -e linux-lts &>/dev/null; then
-        ALPINE_NEEDS_REBOOT=true
-        warn "linux-lts is installed — reboot to activate netfilter support"
-    else
-        info "Installing linux-lts (includes netfilter modules for iptables/Docker)..."
-        apk add --no-cache linux-lts linux-lts-openrc 2>/dev/null || \
-            apk add --no-cache linux-lts 2>/dev/null || \
-            warn "Could not install linux-lts — install manually: apk add linux-lts"
-        ALPINE_NEEDS_REBOOT=true
-        warn "linux-lts installed — REBOOT required before firewall/Docker will work"
-    fi
+    alpine_ensure_linux_lts || true
+    ALPINE_NEEDS_REBOOT=true
+    warn "REBOOT required before iptables/Docker will work"
 }
 
 alpine_force_iptables_legacy() {
@@ -627,8 +662,12 @@ ${DDOS_SCRIPT}
 iptables-legacy-save > /etc/iptables/rules-save 2>/dev/null || iptables-save > /etc/iptables/rules-save 2>/dev/null || true
 EOF
         chmod +x /etc/local.d/rahmat-network.start
-        IPTABLES="${ALPINE_IPT:-iptables-legacy}" bash "$DDOS_SCRIPT" || true
-        ok "OpenRC boot script → /etc/local.d/rahmat-network.start"
+        if [[ "${OS_FAMILY:-}" == "alpine" ]] && [[ "${ALPINE_NETFILTER_OK:-false}" != "true" ]]; then
+            ok "OpenRC boot script → /etc/local.d/rahmat-network.start (rules apply after reboot)"
+        else
+            IPTABLES="${ALPINE_IPT:-iptables-legacy}" bash "$DDOS_SCRIPT" >/dev/null 2>&1 || true
+            ok "OpenRC boot script → /etc/local.d/rahmat-network.start"
+        fi
     fi
 }
 
@@ -666,7 +705,7 @@ banner() {
     echo -e "${HACK_DIM}[!] initialising payload...${RESET}"
     echo -e "${HACK}${BOLD}"
     echo '  ┌──────────────────────────────────────────────────────────┐'
-    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.8.6          │'
+    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.8.7          │'
     echo '  ├──────────────────────────────────────────────────────────┤'
     echo '  │                                                          │'
     echo '  │   ####    ###   #   #  ## ##   ###   #####              │'
@@ -969,6 +1008,10 @@ elif [[ "$PKG_MANAGER" == "apk" ]]; then
     info "Running apk upgrade (this may take a while)..."
     apk upgrade -a
     ok "System packages upgraded successfully"
+    if alpine_is_virt_kernel && ! alpine_netfilter_works 2>/dev/null; then
+        alpine_ensure_linux_lts || true
+        ALPINE_NEEDS_REBOOT=true
+    fi
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -1051,7 +1094,8 @@ elif [[ "$PKG_MANAGER" == "apk" ]]; then
     else
         ok "All essential packages already present"
     fi
-    prepare_alpine_netfilter || warn "Alpine netfilter setup incomplete — iptables may fail until legacy is enabled"
+    prepare_alpine_netfilter || warn "Alpine netfilter setup incomplete"
+    alpine_reboot_gate
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -1626,10 +1670,10 @@ DDOS_SCRIPT="/etc/rahmat/apply-ddos-rules.sh"
 DDOS_CONF="/etc/rahmat/ddos.conf"
 
 info "Loading DDoS kernel modules..."
-[[ "$OS_FAMILY" == "alpine" ]] && prepare_alpine_netfilter
-modprobe xt_hashlimit 2>/dev/null || true
-modprobe xt_connlimit 2>/dev/null || true
-modprobe xt_recent   2>/dev/null || true
+[[ "$OS_FAMILY" == "alpine" ]] && [[ "$ALPINE_NETFILTER_OK" == "true" ]] && prepare_alpine_netfilter
+modprobe xt_hashlimit >/dev/null 2>&1 || true
+modprobe xt_connlimit >/dev/null 2>&1 || true
+modprobe xt_recent   >/dev/null 2>&1 || true
 
 apply_ddos_kernel
 
