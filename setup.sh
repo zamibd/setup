@@ -5,7 +5,7 @@
 #             Rocky · RHEL · CentOS Stream · Fedora (latest) | Alpine Linux 3.x+
 #  Author   : RAHMAT
 #  GitHub   : https://github.com/zamibd/setup/setup.sh
-#  Version  : 2.8.5
+#  Version  : 2.8.6
 # ================================================================
 
 # Re-exec with bash when invoked via ash/sh (Alpine: `sh setup.sh` after download)
@@ -286,6 +286,82 @@ enable_apk_community_repo() {
 
 ALPINE_IPT="${ALPINE_IPT:-iptables-legacy}"
 ALPINE_IP6T="${ALPINE_IP6T:-ip6tables-legacy}"
+ALPINE_NEEDS_REBOOT="${ALPINE_NEEDS_REBOOT:-false}"
+ALPINE_NETFILTER_OK="${ALPINE_NETFILTER_OK:-false}"
+
+alpine_netfilter_works() {
+    local _ipt="${1:-${ALPINE_IPT:-iptables-legacy}}"
+    command -v "$_ipt" >/dev/null 2>&1 || return 1
+    "$_ipt" -L -n >/dev/null 2>&1
+}
+
+alpine_kernel_has_ip_tables_module() {
+    local _kver="$1"
+    local _f
+    for _f in \
+        "/lib/modules/${_kver}/kernel/net/ipv4/netfilter/ip_tables.ko.xz" \
+        "/lib/modules/${_kver}/kernel/net/ipv4/netfilter/ip_tables.ko.gz" \
+        "/lib/modules/${_kver}/kernel/net/ipv4/netfilter/ip_tables.ko"; do
+        [[ -f "$_f" ]] && return 0
+    done
+    return 1
+}
+
+alpine_fix_kernel_netfilter() {
+    local _running _k _name
+
+    _running=$(uname -r)
+
+    # Newer kernel modules installed (apk upgrade) but old kernel still running
+    for _k in /lib/modules/*/; do
+        _name="${_k#/lib/modules/}"
+        _name="${_name%/}"
+        [[ "$_name" == "$_running" ]] && continue
+        alpine_kernel_has_ip_tables_module "$_name" || continue
+        ALPINE_NEEDS_REBOOT=true
+        warn "Kernel ${_name} installed but running ${_running} — reboot required for netfilter"
+        return 0
+    done
+
+    if alpine_netfilter_works; then
+        ALPINE_NETFILTER_OK=true
+        return 0
+    fi
+
+    if alpine_kernel_has_ip_tables_module "$_running"; then
+        cat > /etc/modules-load.d/rahmat-netfilter.conf << 'EOF'
+ip_tables
+ip6_tables
+nf_conntrack
+xt_conntrack
+xt_recent
+xt_hashlimit
+xt_connlimit
+br_netfilter
+overlay
+EOF
+        modprobe ip_tables >/dev/null 2>&1 || true
+        modprobe ip6_tables >/dev/null 2>&1 || true
+        if alpine_netfilter_works; then
+            ALPINE_NETFILTER_OK=true
+            return 0
+        fi
+    fi
+
+    # linux-virt often ships without ip_tables — Docker/firewall need linux-lts
+    warn "ip_tables missing for kernel ${_running} (linux-virt is too minimal for iptables/Docker)"
+    if apk info -e linux-lts &>/dev/null; then
+        ALPINE_NEEDS_REBOOT=true
+        warn "linux-lts is installed — reboot to activate netfilter support"
+    else
+        info "Installing linux-lts (includes netfilter modules for iptables/Docker)..."
+        apk add --no-cache linux-lts linux-lts-openrc 2>/dev/null || \
+            apk add --no-cache linux-lts 2>/dev/null || \
+            warn "Could not install linux-lts — install manually: apk add linux-lts"
+        ALPINE_NEEDS_REBOOT=true
+        warn "linux-lts installed — REBOOT required before firewall/Docker will work"
+    fi
+}
 
 alpine_force_iptables_legacy() {
     # Alpine 3.19+ defaults `iptables` → nft; virt kernels often lack nft support.
@@ -305,21 +381,30 @@ prepare_alpine_netfilter() {
     apk add --no-cache iptables-legacy iptables-legacy-openrc 2>/dev/null || \
         apk add --no-cache iptables-legacy 2>/dev/null || true
 
+    alpine_fix_kernel_netfilter
+
+    if [[ "$ALPINE_NETFILTER_OK" != "true" ]] && [[ "$ALPINE_NEEDS_REBOOT" == "true" ]]; then
+        warn "Alpine netfilter pending — complete setup after reboot (firewall/DDoS deferred)"
+        return 0
+    fi
+
     for _m in ip_tables ip_conntrack nf_conntrack \
         xt_conntrack xt_recent xt_hashlimit xt_connlimit br_netfilter overlay; do
-        modprobe "$_m" 2>/dev/null || true
+        modprobe "$_m" >/dev/null 2>&1 || true
     done
 
     alpine_force_iptables_legacy
 
-    if command -v iptables-legacy &>/dev/null && iptables-legacy -L -n &>/dev/null 2>&1; then
+    if alpine_netfilter_works iptables-legacy; then
         ALPINE_IPT="iptables-legacy"
         ALPINE_IP6T="ip6tables-legacy"
-    elif iptables -L -n &>/dev/null 2>&1; then
+        ALPINE_NETFILTER_OK=true
+    elif alpine_netfilter_works iptables; then
         ALPINE_IPT="iptables"
         ALPINE_IP6T="ip6tables"
+        ALPINE_NETFILTER_OK=true
     else
-        warn "iptables-legacy unavailable on this kernel"
+        warn "iptables unavailable on this kernel — install linux-lts and reboot"
         return 0
     fi
 
@@ -581,7 +666,7 @@ banner() {
     echo -e "${HACK_DIM}[!] initialising payload...${RESET}"
     echo -e "${HACK}${BOLD}"
     echo '  ┌──────────────────────────────────────────────────────────┐'
-    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.8.5          │'
+    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.8.6          │'
     echo '  ├──────────────────────────────────────────────────────────┤'
     echo '  │                                                          │'
     echo '  │   ####    ###   #   #  ## ##   ###   #####              │'
@@ -1507,23 +1592,29 @@ $IPT -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null || \
     $IPT -A INPUT -p icmp --icmp-type echo-request -j DROP
 EOFALPINE
     chmod +x "$ALPINE_FW"
-    if ! IPTABLES="${ALPINE_IPT}" sh "$ALPINE_FW"; then
-        warn "Alpine firewall rules failed — check ${ALPINE_IPT} and kernel modules"
+    if [[ "$ALPINE_NETFILTER_OK" == "true" ]]; then
+        if ! IPTABLES="${ALPINE_IPT}" sh "$ALPINE_FW"; then
+            warn "Alpine firewall rules failed — check ${ALPINE_IPT} and kernel modules"
+        fi
+        alpine_iptables_save
+        rc-update add iptables-legacy boot 2>/dev/null || rc-update add iptables boot 2>/dev/null || true
+    else
+        warn "Skipping Alpine firewall rules — netfilter unavailable until reboot"
     fi
-    alpine_iptables_save
-    rc-update add iptables-legacy boot 2>/dev/null || rc-update add iptables boot 2>/dev/null || true
 
-    ok "Default policy → ${BRED}DENY${RESET} incoming / ${BGREEN}ALLOW${RESET} outgoing"
-    echo ""
-    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}53${RESET}/${HACK}UDP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}DNS — Plain UDP (primary)${RESET}"
-    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}53${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}DNS — Plain TCP (fallback)${RESET}"
-    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}853${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}DoT — DNS-over-TLS${RESET}"
-    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}22${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}SSH — rate limited (DDoS)${RESET}"
-    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}80${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}HTTP — ACME / Certificate Renewal${RESET}"
-    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}443${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}HTTPS — DoH (DNS-over-HTTPS)${RESET}"
-    ok "ICMP ping blocked (iptables + sysctl)"
-    echo ""
-    ok "Alpine iptables firewall ${BGREEN}active${RESET}"
+    if [[ "$ALPINE_NETFILTER_OK" == "true" ]]; then
+        ok "Default policy → ${BRED}DENY${RESET} incoming / ${BGREEN}ALLOW${RESET} outgoing"
+        echo ""
+        echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}53${RESET}/${HACK}UDP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}DNS — Plain UDP (primary)${RESET}"
+        echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}53${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}DNS — Plain TCP (fallback)${RESET}"
+        echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}853${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}DoT — DNS-over-TLS${RESET}"
+        echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}22${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}SSH — rate limited (DDoS)${RESET}"
+        echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}80${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}HTTP — ACME / Certificate Renewal${RESET}"
+        echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}443${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}HTTPS — DoH (DNS-over-HTTPS)${RESET}"
+        ok "ICMP ping blocked (iptables + sysctl)"
+        echo ""
+        ok "Alpine iptables firewall ${BGREEN}active${RESET}"
+    fi
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -1543,14 +1634,22 @@ modprobe xt_recent   2>/dev/null || true
 apply_ddos_kernel
 
 info "Installing per-IP rate limits (53 udp/tcp · 853 · 443)..."
-install_ddos_script
+if [[ "$OS_FAMILY" == "alpine" ]] && [[ "$ALPINE_NETFILTER_OK" != "true" ]]; then
+    warn "Skipping iptables DDoS rules — netfilter unavailable (reboot after linux-lts install)"
+else
+    install_ddos_script
+fi
 
 if [[ "$PKG_MANAGER" == "dnf" ]]; then
     apply_ddos_firewalld
     ok "firewalld DDoS passthrough rules applied"
 fi
 
-ok "DDoS protection active"
+if [[ "$OS_FAMILY" == "alpine" ]] && [[ "$ALPINE_NETFILTER_OK" != "true" ]]; then
+    warn "DDoS iptables rules deferred — netfilter unavailable until reboot"
+else
+    ok "DDoS protection active"
+fi
 detail "Config        : ${DDOS_CONF}"
 detail "Script        : ${DDOS_SCRIPT}"
 detail "Service       : rahmat-ddos.service"
@@ -1637,15 +1736,21 @@ if [[ ${#SSH_WHITELIST[@]} -gt 0 ]]; then
             detail "UFW allow SSH from $ip"
         done
     elif [[ "$PKG_MANAGER" == "apk" ]]; then
-        _alpine_ipt="${ALPINE_IPT:-iptables-legacy}"
-        $_alpine_ipt -D INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
-        $_alpine_ipt -D INPUT -p tcp --dport 22 -m recent --name SSH --update --seconds 60 --hitcount 4 -j DROP 2>/dev/null || true
-        $_alpine_ipt -D INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --name SSH --set 2>/dev/null || true
-        for ip in "${SSH_WHITELIST[@]}"; do
-            $_alpine_ipt -I INPUT -p tcp -s "$ip" --dport 22 -j ACCEPT
-            detail "iptables allow SSH from $ip"
-        done
-        alpine_iptables_save
+        if [[ "$ALPINE_NETFILTER_OK" != "true" ]]; then
+            warn "SSH IP whitelist skipped — iptables unavailable until reboot (linux-lts)"
+            detail "Whitelist saved in .env — re-run setup.sh after reboot to apply firewall rules"
+        else
+            _alpine_ipt="${ALPINE_IPT:-iptables-legacy}"
+            $_alpine_ipt -D INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+            $_alpine_ipt -D INPUT -p tcp --dport 22 -m recent --name SSH --update --seconds 60 --hitcount 4 -j DROP 2>/dev/null || true
+            $_alpine_ipt -D INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --name SSH --set 2>/dev/null || true
+            for ip in "${SSH_WHITELIST[@]}"; do
+                $_alpine_ipt -I INPUT -p tcp -s "$ip" --dport 22 -j ACCEPT 2>/dev/null || \
+                    warn "Could not add iptables rule for SSH from $ip"
+                detail "iptables allow SSH from $ip"
+            done
+            alpine_iptables_save
+        fi
     else
         firewall-cmd --permanent --remove-port=22/tcp > /dev/null 2>&1 || true
         for ip in "${SSH_WHITELIST[@]}"; do
@@ -2075,6 +2180,7 @@ if [[ "$OS_FAMILY" == "alpine" ]]; then
     echo -e "  ${HACK}║${RESET}  Distro      ${HACK_DIM}:${RESET}  ${OS_DISPLAY}"
     echo -e "  ${HACK}║${RESET}  Init        ${HACK_DIM}:${RESET}  $(has_systemd && echo systemd || echo OpenRC)"
     echo -e "  ${HACK}║${RESET}  Firewall    ${HACK_DIM}:${RESET}  iptables (/etc/rahmat/apply-alpine-firewall.sh)"
+    echo -e "  ${HACK}║${RESET}  Netfilter   ${HACK_DIM}:${RESET}  $([[ "$ALPINE_NETFILTER_OK" == true ]] && echo active || echo pending reboot/linux-lts)"
     echo -e "  ${HACK}║${RESET}  Docker      ${HACK_DIM}:${RESET}  apk (cgroupfs driver)"
     echo -e "  ${HACK}║${RESET}  DDoS boot   ${HACK_DIM}:${RESET}  /etc/local.d/rahmat-network.start"
     echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
@@ -2086,6 +2192,9 @@ echo ""
 if [[ "${DOCKER_NEEDS_REBOOT:-false}" == "true" ]]; then
     echo -e "  ${HACK_ERR}[!]${RESET}  ${BOLD}REBOOT REQUIRED${RESET} — Docker needs the updated kernel's netfilter modules"
     echo -e "  ${HACK}[>]${RESET}  ${BOLD}reboot${RESET}  ${HACK_DIM}# docker.service will start automatically${RESET}"
+elif [[ "${ALPINE_NEEDS_REBOOT:-false}" == "true" ]]; then
+    echo -e "  ${HACK_ERR}[!]${RESET}  ${BOLD}REBOOT REQUIRED${RESET} — Alpine linux-virt lacks ip_tables; linux-lts needed for iptables/Docker"
+    echo -e "  ${HACK}[>]${RESET}  ${BOLD}reboot${RESET}  ${HACK_DIM}# then re-run: bash setup.sh${RESET}"
 else
     echo -e "  ${HACK_WARN}[!]${RESET}  REBOOT RECOMMENDED — kernel params pending full apply"
     echo -e "  ${HACK}[>]${RESET}  ${BOLD}reboot${RESET}"
