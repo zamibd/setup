@@ -5,7 +5,7 @@
 #             Rocky · RHEL · CentOS Stream · Fedora (latest) | Alpine Linux 3.x+
 #  Author   : RAHMAT
 #  GitHub   : https://github.com/zamibd/setup/setup.sh
-#  Version  : 2.8.4
+#  Version  : 2.8.5
 # ================================================================
 
 # Re-exec with bash when invoked via ash/sh (Alpine: `sh setup.sh` after download)
@@ -287,35 +287,72 @@ enable_apk_community_repo() {
 ALPINE_IPT="${ALPINE_IPT:-iptables-legacy}"
 ALPINE_IP6T="${ALPINE_IP6T:-ip6tables-legacy}"
 
+alpine_force_iptables_legacy() {
+    # Alpine 3.19+ defaults `iptables` → nft; virt kernels often lack nft support.
+    local _bin _legacy
+    for _bin in iptables iptables-save iptables-restore \
+                ip6tables ip6tables-save ip6tables-restore; do
+        _legacy="${_bin}-legacy"
+        command -v "$_legacy" >/dev/null 2>&1 || continue
+        ln -sf "$(command -v "$_legacy")" "/usr/sbin/${_bin}" 2>/dev/null || \
+            ln -sf "/usr/sbin/${_legacy}" "/usr/sbin/${_bin}" 2>/dev/null || true
+    done
+}
+
 prepare_alpine_netfilter() {
     [[ "${OS_FAMILY:-}" == "alpine" ]] || return 0
 
     apk add --no-cache iptables-legacy iptables-legacy-openrc 2>/dev/null || \
         apk add --no-cache iptables-legacy 2>/dev/null || true
 
-    for _m in nf_tables nf_nat nf_conntrack ip_tables ip_conntrack \
+    for _m in ip_tables ip_conntrack nf_conntrack \
         xt_conntrack xt_recent xt_hashlimit xt_connlimit br_netfilter overlay; do
         modprobe "$_m" 2>/dev/null || true
     done
 
+    alpine_force_iptables_legacy
+
     if command -v iptables-legacy &>/dev/null && iptables-legacy -L -n &>/dev/null 2>&1; then
         ALPINE_IPT="iptables-legacy"
         ALPINE_IP6T="ip6tables-legacy"
-    elif command -v iptables &>/dev/null; then
+    elif iptables -L -n &>/dev/null 2>&1; then
         ALPINE_IPT="iptables"
         ALPINE_IP6T="ip6tables"
+    else
+        warn "iptables-legacy unavailable on this kernel"
+        return 0
     fi
 
-    mkdir -p /etc/conf.d
-    if [[ ! -f /etc/conf.d/docker ]] || ! grep -q 'RAHMAT.*IPTABLES' /etc/conf.d/docker 2>/dev/null; then
+    mkdir -p /etc/conf.d /etc/profile.d
+    cat > /etc/profile.d/rahmat-iptables.sh << EOF
+# RAHMAT — Alpine legacy iptables (nft unsupported on many virt kernels)
+export IPTABLES=${ALPINE_IPT}
+export IP6TABLES=${ALPINE_IP6T}
+EOF
+    chmod 644 /etc/profile.d/rahmat-iptables.sh
+
+    if [[ -f /etc/conf.d/docker ]] && grep -q 'RAHMAT.*IPTABLES' /etc/conf.d/docker 2>/dev/null; then
+        :
+    elif [[ -f /etc/conf.d/docker ]]; then
         {
+            echo ""
             echo "# RAHMAT — legacy iptables on Alpine virt/minimal kernels (nft may be unavailable)"
             echo "export IPTABLES=${ALPINE_IPT}"
             echo "export IP6TABLES=${ALPINE_IP6T}"
         } >> /etc/conf.d/docker
+    else
+        cat > /etc/conf.d/docker << EOF
+# RAHMAT — legacy iptables for Docker on Alpine
+export IPTABLES=${ALPINE_IPT}
+export IP6TABLES=${ALPINE_IP6T}
+EOF
     fi
 
-    ok "Alpine netfilter ready (${ALPINE_IPT})"
+    rc-update del nftables boot 2>/dev/null || true
+    rc-service nftables stop 2>/dev/null || true
+    rc-update add iptables-legacy boot 2>/dev/null || true
+
+    ok "Alpine netfilter ready (${ALPINE_IPT}, system iptables → legacy)"
 }
 
 alpine_iptables_save() {
@@ -544,7 +581,7 @@ banner() {
     echo -e "${HACK_DIM}[!] initialising payload...${RESET}"
     echo -e "${HACK}${BOLD}"
     echo '  ┌──────────────────────────────────────────────────────────┐'
-    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.8.4          │'
+    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.8.5          │'
     echo '  ├──────────────────────────────────────────────────────────┤'
     echo '  │                                                          │'
     echo '  │   ####    ###   #   #  ## ##   ###   #####              │'
@@ -929,6 +966,7 @@ elif [[ "$PKG_MANAGER" == "apk" ]]; then
     else
         ok "All essential packages already present"
     fi
+    prepare_alpine_netfilter || warn "Alpine netfilter setup incomplete — iptables may fail until legacy is enabled"
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -1106,10 +1144,11 @@ install_docker_dnf() {
 
 install_docker_apk() {
     enable_apk_community_repo
-    prepare_alpine_netfilter
     info "Installing Docker from Alpine repositories..."
     apk add --no-cache docker docker-cli docker-cli-compose containerd
     ok "Docker packages installed"
+
+    prepare_alpine_netfilter || warn "Alpine netfilter setup incomplete — Docker may fail to start"
 
     apply_docker_daemon_config
 
@@ -1439,7 +1478,8 @@ elif [[ "$PKG_MANAGER" == "apk" ]]; then
 #!/bin/sh
 # RAHMAT — Alpine base iptables (DDoS chain applied separately)
 IPT="${IPTABLES:-iptables-legacy}"
-command -v "$IPT" >/dev/null 2>&1 || IPT=iptables
+command -v "$IPT" >/dev/null 2>&1 || IPT=iptables-legacy
+command -v "$IPT" >/dev/null 2>&1 || { echo "iptables-legacy not found" >&2; exit 1; }
 
 $IPT -P INPUT DROP
 $IPT -P FORWARD DROP
