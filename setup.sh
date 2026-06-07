@@ -5,7 +5,7 @@
 #             Rocky · RHEL · CentOS Stream · Fedora (latest) | Alpine Linux 3.x+
 #  Author   : RAHMAT
 #  GitHub   : https://github.com/zamibd/setup/setup.sh
-#  Version  : 2.8.3
+#  Version  : 2.8.4
 # ================================================================
 
 # Re-exec with bash when invoked via ash/sh (Alpine: `sh setup.sh` after download)
@@ -290,9 +290,8 @@ ALPINE_IP6T="${ALPINE_IP6T:-ip6tables-legacy}"
 prepare_alpine_netfilter() {
     [[ "${OS_FAMILY:-}" == "alpine" ]] || return 0
 
-    apk add --no-cache iptables-legacy ip6tables-legacy \
-        iptables-legacy-openrc ip6tables-legacy-openrc 2>/dev/null || \
-        apk add --no-cache iptables-legacy ip6tables-legacy 2>/dev/null || true
+    apk add --no-cache iptables-legacy iptables-legacy-openrc 2>/dev/null || \
+        apk add --no-cache iptables-legacy 2>/dev/null || true
 
     for _m in nf_tables nf_nat nf_conntrack ip_tables ip_conntrack \
         xt_conntrack xt_recent xt_hashlimit xt_connlimit br_netfilter overlay; do
@@ -545,7 +544,7 @@ banner() {
     echo -e "${HACK_DIM}[!] initialising payload...${RESET}"
     echo -e "${HACK}${BOLD}"
     echo '  ┌──────────────────────────────────────────────────────────┐'
-    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.8.3          │'
+    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.8.4          │'
     echo '  ├──────────────────────────────────────────────────────────┤'
     echo '  │                                                          │'
     echo '  │   ####    ###   #   #  ## ##   ###   #####              │'
@@ -908,8 +907,8 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
 
 elif [[ "$PKG_MANAGER" == "apk" ]]; then
     PKGS=(
-        bash curl wget git fail2ban iptables ip6tables ipset linux-pam
-        iptables-legacy ip6tables-legacy
+        bash curl wget git fail2ban iptables ipset linux-pam
+        iptables-legacy
         ca-certificates htop net-tools make gcc musl-dev linux-headers
         grep tzdata openssh openssl dcron
     )
