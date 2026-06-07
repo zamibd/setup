@@ -5,7 +5,7 @@
 #             Rocky · RHEL · CentOS Stream · Fedora (latest) | Alpine Linux 3.x+
 #  Author   : RAHMAT
 #  GitHub   : https://github.com/zamibd/setup/setup.sh
-#  Version  : 2.9.0
+#  Version  : 2.9.1
 # ================================================================
 
 # Re-exec with bash when invoked via ash/sh (Alpine: `sh setup.sh` after download)
@@ -639,6 +639,44 @@ wait_for_docker() {
     return 1
 }
 
+alpine_docker_log_tail() {
+    [[ -f /var/log/docker.log ]] || return 0
+    tail -8 /var/log/docker.log 2>/dev/null | while read -r _line; do
+        detail "${_line}"
+    done
+}
+
+ensure_docker_alpine() {
+    prepare_alpine_netfilter || warn "Alpine netfilter setup incomplete — Docker may fail"
+
+    apk add --no-cache docker-openrc containerd-openrc 2>/dev/null || true
+
+    if [[ ! -f /etc/docker/daemon.json ]]; then
+        apply_docker_daemon_config
+    fi
+
+    svc_enable_now containerd
+    svc_enable_now docker
+    sleep 2
+
+    if ! svc_is_active docker; then
+        rc-service docker zap 2>/dev/null || true
+        svc_restart docker
+        sleep 3
+    fi
+
+    if wait_for_docker; then
+        ok "Docker service enabled & started"
+        return 0
+    fi
+
+    warn "Docker daemon not responding"
+    rc-service docker status 2>/dev/null | tail -3 | while read -r _line; do detail "${_line}"; done
+    alpine_docker_log_tail
+    warn "Debug: rc-service docker status; tail /var/log/docker.log"
+    return 1
+}
+
 apply_ddos_kernel() {
     local ddos_sysctl="/etc/sysctl.d/99-rahmat-ddos.conf"
     cat > "$ddos_sysctl" << 'EOF'
@@ -851,7 +889,7 @@ banner() {
     echo -e "${HACK_DIM}[!] initialising payload...${RESET}"
     echo -e "${HACK}${BOLD}"
     echo '  ┌──────────────────────────────────────────────────────────┐'
-    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.9.0          │'
+    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.9.1          │'
     echo '  ├──────────────────────────────────────────────────────────┤'
     echo '  │                                                          │'
     echo '  │   ####    ###   #   #  ## ##   ###   #####              │'
@@ -1426,29 +1464,11 @@ install_docker_dnf() {
 install_docker_apk() {
     enable_apk_community_repo
     info "Installing Docker from Alpine repositories..."
-    apk add --no-cache docker docker-cli docker-cli-compose containerd
+    apk add --no-cache \
+        docker docker-openrc docker-cli docker-cli-compose \
+        containerd containerd-openrc
     ok "Docker packages installed"
-
-    prepare_alpine_netfilter || warn "Alpine netfilter setup incomplete — Docker may fail to start"
-
-    apply_docker_daemon_config
-
-    svc_enable_now containerd
-    svc_enable_now docker
-    sleep 2
-    if ! svc_is_active docker; then
-        warn "Docker not active after first start, restarting..."
-        svc_restart docker
-        sleep 3
-    fi
-
-    if wait_for_docker; then
-        ok "Docker service enabled & started"
-    elif svc_is_active docker; then
-        warn "Docker service running but API not ready — check: tail /var/log/docker.log"
-    else
-        warn "Docker service may have issues — check: rc-service docker status; tail /var/log/docker.log"
-    fi
+    ensure_docker_alpine || warn "Docker service failed — check /var/log/docker.log"
 }
 
 upgrade_docker_apt() {
@@ -1501,11 +1521,9 @@ if command -v docker &>/dev/null; then
                 ensure_docker_running || true
                 ;;
             apk)
-                warn "Docker daemon not responding — retrying with Alpine netfilter recovery..."
-                prepare_alpine_netfilter
-                svc_enable_now containerd
-                svc_restart docker
-                wait_for_docker || warn "Docker still not responding — check /var/log/docker.log"
+                warn "Docker daemon not responding — retrying with Alpine recovery..."
+                apk add --no-cache docker docker-openrc containerd containerd-openrc 2>/dev/null || true
+                ensure_docker_alpine || true
                 ;;
         esac
     fi
