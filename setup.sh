@@ -268,6 +268,59 @@ enable_apk_community_repo() {
         sed -i '' 's|^#\(.*/community\)|\1|' /etc/apk/repositories 2>/dev/null || true
 }
 
+ALPINE_IPT="${ALPINE_IPT:-iptables-legacy}"
+ALPINE_IP6T="${ALPINE_IP6T:-ip6tables-legacy}"
+
+prepare_alpine_netfilter() {
+    [[ "${OS_FAMILY:-}" == "alpine" ]] || return 0
+
+    apk add --no-cache iptables-legacy ip6tables-legacy \
+        iptables-legacy-openrc ip6tables-legacy-openrc 2>/dev/null || \
+        apk add --no-cache iptables-legacy ip6tables-legacy 2>/dev/null || true
+
+    for _m in nf_tables nf_nat nf_conntrack ip_tables ip_conntrack \
+        xt_conntrack xt_recent xt_hashlimit xt_connlimit br_netfilter overlay; do
+        modprobe "$_m" 2>/dev/null || true
+    done
+
+    if command -v iptables-legacy &>/dev/null && iptables-legacy -L -n &>/dev/null 2>&1; then
+        ALPINE_IPT="iptables-legacy"
+        ALPINE_IP6T="ip6tables-legacy"
+    elif command -v iptables &>/dev/null; then
+        ALPINE_IPT="iptables"
+        ALPINE_IP6T="ip6tables"
+    fi
+
+    mkdir -p /etc/conf.d
+    if [[ ! -f /etc/conf.d/docker ]] || ! grep -q 'RAHMAT.*IPTABLES' /etc/conf.d/docker 2>/dev/null; then
+        {
+            echo "# RAHMAT — legacy iptables on Alpine virt/minimal kernels (nft may be unavailable)"
+            echo "export IPTABLES=${ALPINE_IPT}"
+            echo "export IP6TABLES=${ALPINE_IP6T}"
+        } >> /etc/conf.d/docker
+    fi
+
+    ok "Alpine netfilter ready (${ALPINE_IPT})"
+}
+
+alpine_iptables_save() {
+    mkdir -p /etc/iptables
+    if command -v iptables-legacy-save &>/dev/null; then
+        iptables-legacy-save > /etc/iptables/rules-save 2>/dev/null || true
+    else
+        iptables-save > /etc/iptables/rules-save 2>/dev/null || true
+    fi
+}
+
+wait_for_docker() {
+    local _i
+    for _i in $(seq 1 15); do
+        docker info &>/dev/null 2>&1 && return 0
+        sleep 2
+    done
+    return 1
+}
+
 apply_ddos_kernel() {
     local ddos_sysctl="/etc/sysctl.d/99-rahmat-ddos.conf"
     cat > "$ddos_sysctl" << 'EOF'
@@ -353,7 +406,11 @@ SYN_RATE="${SYN_RATE:-2000/sec}"
 SYN_BURST="${SYN_BURST:-4000}"
 
 CHAIN="RAHMAT-DDoS"
-IPT="${IPTABLES:-iptables}"
+if [[ -z "${IPTABLES:-}" ]] && command -v iptables-legacy &>/dev/null; then
+    IPT="iptables-legacy"
+else
+    IPT="${IPTABLES:-iptables}"
+fi
 
 modprobe xt_hashlimit 2>/dev/null || true
 modprobe xt_connlimit 2>/dev/null || true
@@ -426,12 +483,14 @@ EOF
         cat > /etc/local.d/rahmat-network.start << EOF
 #!/bin/sh
 # RAHMAT — Alpine/OpenRC firewall + DDoS rules at boot
+export IPTABLES=${ALPINE_IPT:-iptables-legacy}
+export IP6TABLES=${ALPINE_IP6T:-ip6tables-legacy}
 [ -x /etc/rahmat/apply-alpine-firewall.sh ] && /etc/rahmat/apply-alpine-firewall.sh
 ${DDOS_SCRIPT}
-iptables-save > /etc/iptables/rules-save 2>/dev/null || true
+iptables-legacy-save > /etc/iptables/rules-save 2>/dev/null || iptables-save > /etc/iptables/rules-save 2>/dev/null || true
 EOF
         chmod +x /etc/local.d/rahmat-network.start
-        bash "$DDOS_SCRIPT" || true
+        IPTABLES="${ALPINE_IPT:-iptables-legacy}" bash "$DDOS_SCRIPT" || true
         ok "OpenRC boot script → /etc/local.d/rahmat-network.start"
     fi
 }
@@ -834,6 +893,7 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
 elif [[ "$PKG_MANAGER" == "apk" ]]; then
     PKGS=(
         bash curl wget git fail2ban iptables ip6tables ipset linux-pam
+        iptables-legacy ip6tables-legacy
         ca-certificates htop net-tools make gcc musl-dev linux-headers
         grep tzdata openssh openssl dcron
     )
@@ -1031,12 +1091,14 @@ install_docker_dnf() {
 
 install_docker_apk() {
     enable_apk_community_repo
+    prepare_alpine_netfilter
     info "Installing Docker from Alpine repositories..."
     apk add --no-cache docker docker-cli docker-cli-compose containerd
     ok "Docker packages installed"
 
     apply_docker_daemon_config
 
+    svc_enable_now containerd
     svc_enable_now docker
     sleep 2
     if ! svc_is_active docker; then
@@ -1045,10 +1107,12 @@ install_docker_apk() {
         sleep 3
     fi
 
-    if svc_is_active docker; then
+    if wait_for_docker; then
         ok "Docker service enabled & started"
+    elif svc_is_active docker; then
+        warn "Docker service running but API not ready — check: tail /var/log/docker.log"
     else
-        warn "Docker service may have issues — check: rc-service docker status"
+        warn "Docker service may have issues — check: rc-service docker status; tail /var/log/docker.log"
     fi
 }
 
@@ -1093,11 +1157,22 @@ if command -v docker &>/dev/null; then
         skip "daemon.json already exists"
     fi
 
-    if ! docker info &>/dev/null 2>&1 && [[ "$PKG_MANAGER" == "dnf" ]]; then
-        warn "Docker daemon not responding — retrying with EL host recovery..."
-        prepare_docker_dnf_host
-        svc_daemon_reload
-        ensure_docker_running || true
+    if ! docker info &>/dev/null 2>&1; then
+        case "$PKG_MANAGER" in
+            dnf)
+                warn "Docker daemon not responding — retrying with EL host recovery..."
+                prepare_docker_dnf_host
+                svc_daemon_reload
+                ensure_docker_running || true
+                ;;
+            apk)
+                warn "Docker daemon not responding — retrying with Alpine netfilter recovery..."
+                prepare_alpine_netfilter
+                svc_enable_now containerd
+                svc_restart docker
+                wait_for_docker || warn "Docker still not responding — check /var/log/docker.log"
+                ;;
+        esac
     fi
 else
     case "$PKG_MANAGER" in
@@ -1342,14 +1417,14 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
 elif [[ "$PKG_MANAGER" == "apk" ]]; then
     ALPINE_FW="/etc/rahmat/apply-alpine-firewall.sh"
     info "Configuring Alpine iptables firewall..."
-    command -v iptables &>/dev/null || apk add --no-cache iptables ip6tables iptables-legacy
+    prepare_alpine_netfilter
     mkdir -p /etc/rahmat /etc/iptables
 
     cat > "$ALPINE_FW" << 'EOFALPINE'
 #!/bin/sh
 # RAHMAT — Alpine base iptables (DDoS chain applied separately)
-set -e
-IPT="${IPTABLES:-iptables}"
+IPT="${IPTABLES:-iptables-legacy}"
+command -v "$IPT" >/dev/null 2>&1 || IPT=iptables
 
 $IPT -P INPUT DROP
 $IPT -P FORWARD DROP
@@ -1377,8 +1452,10 @@ $IPT -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null || \
     $IPT -A INPUT -p icmp --icmp-type echo-request -j DROP
 EOFALPINE
     chmod +x "$ALPINE_FW"
-    sh "$ALPINE_FW"
-    iptables-save > /etc/iptables/rules-save 2>/dev/null || true
+    if ! IPTABLES="${ALPINE_IPT}" sh "$ALPINE_FW"; then
+        warn "Alpine firewall rules failed — check ${ALPINE_IPT} and kernel modules"
+    fi
+    alpine_iptables_save
     rc-update add iptables-legacy boot 2>/dev/null || rc-update add iptables boot 2>/dev/null || true
 
     ok "Default policy → ${BRED}DENY${RESET} incoming / ${BGREEN}ALLOW${RESET} outgoing"
@@ -1403,6 +1480,7 @@ DDOS_SCRIPT="/etc/rahmat/apply-ddos-rules.sh"
 DDOS_CONF="/etc/rahmat/ddos.conf"
 
 info "Loading DDoS kernel modules..."
+[[ "$OS_FAMILY" == "alpine" ]] && prepare_alpine_netfilter
 modprobe xt_hashlimit 2>/dev/null || true
 modprobe xt_connlimit 2>/dev/null || true
 modprobe xt_recent   2>/dev/null || true
@@ -1504,14 +1582,15 @@ if [[ ${#SSH_WHITELIST[@]} -gt 0 ]]; then
             detail "UFW allow SSH from $ip"
         done
     elif [[ "$PKG_MANAGER" == "apk" ]]; then
-        iptables -D INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p tcp --dport 22 -m recent --name SSH --update --seconds 60 --hitcount 4 -j DROP 2>/dev/null || true
-        iptables -D INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --name SSH --set 2>/dev/null || true
+        _alpine_ipt="${ALPINE_IPT:-iptables-legacy}"
+        $_alpine_ipt -D INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+        $_alpine_ipt -D INPUT -p tcp --dport 22 -m recent --name SSH --update --seconds 60 --hitcount 4 -j DROP 2>/dev/null || true
+        $_alpine_ipt -D INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --name SSH --set 2>/dev/null || true
         for ip in "${SSH_WHITELIST[@]}"; do
-            iptables -I INPUT -p tcp -s "$ip" --dport 22 -j ACCEPT
+            $_alpine_ipt -I INPUT -p tcp -s "$ip" --dport 22 -j ACCEPT
             detail "iptables allow SSH from $ip"
         done
-        iptables-save > /etc/iptables/rules-save 2>/dev/null || true
+        alpine_iptables_save
     else
         firewall-cmd --permanent --remove-port=22/tcp > /dev/null 2>&1 || true
         for ip in "${SSH_WHITELIST[@]}"; do
@@ -1885,8 +1964,8 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
     FW_NAME="UFW"
     FW_STATE=$(ufw status | head -1 | awk '{print $NF}')
 elif [[ "$PKG_MANAGER" == "apk" ]]; then
-    FW_NAME="iptables"
-    FW_STATE=$(iptables -L INPUT -n 2>/dev/null | head -1 | grep -qi policy && echo "active" || echo "unknown")
+    FW_NAME="iptables (${ALPINE_IPT})"
+    FW_STATE=$(${ALPINE_IPT:-iptables-legacy} -L INPUT -n 2>/dev/null | head -1 | grep -qi policy && echo "active" || echo "unknown")
 else
     FW_NAME="firewalld"
     FW_STATE=$(systemctl is-active firewalld 2>/dev/null || echo "unknown")
