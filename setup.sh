@@ -5,7 +5,7 @@
 #             Rocky · RHEL · CentOS Stream · Fedora (latest) | Alpine Linux 3.x+
 #  Author   : RAHMAT
 #  GitHub   : https://github.com/zamibd/setup/setup.sh
-#  Version  : 2.8.1
+#  Version  : 2.8.2
 # ================================================================
 
 set -euo pipefail
@@ -175,11 +175,11 @@ port_is_bound() {
 }
 
 extract_semver() {
-    sed -nE 's/.*([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -1
+    grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
 }
 
 extract_version_short() {
-    sed -nE 's/.*([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p' | head -1
+    grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1
 }
 
 has_systemd() {
@@ -470,7 +470,7 @@ banner() {
     echo -e "${HACK_DIM}[!] initialising payload...${RESET}"
     echo -e "${HACK}${BOLD}"
     echo '  ┌──────────────────────────────────────────────────────────┐'
-    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.7.0          │'
+    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v2.8.2          │'
     echo '  ├──────────────────────────────────────────────────────────┤'
     echo '  │                                                          │'
     echo '  │   ####    ###   #   #  ## ##   ###   #####              │'
@@ -865,29 +865,43 @@ rhel_docker_journal_tail() {
     journalctl -u docker.service -n 20 --no-pager 2>/dev/null | tail -10 || true
 }
 
+# Required netfilter modules for the Docker bridge/NAT driver (EL family)
+DOCKER_NF_MODULES=(overlay br_netfilter nf_conntrack nf_nat xt_addrtype xt_conntrack xt_nat)
+DOCKER_NEEDS_REBOOT="${DOCKER_NEEDS_REBOOT:-false}"
+
 prepare_docker_dnf_host() {
     info "Preparing RHEL-family host for Docker..."
-    modprobe overlay 2>/dev/null || true
-    modprobe br_netfilter 2>/dev/null || true
+    local kver
+    kver=$(uname -r)
 
-    local _extra_pkgs=()
-    rpm -q iptables-nft &>/dev/null || _extra_pkgs+=(iptables-nft)
-    if is_rhel_el10_plus; then
-        rpm -q kernel-modules-extra &>/dev/null || _extra_pkgs+=(kernel-modules-extra)
+    rpm -q iptables-nft &>/dev/null || dnf install -y -q iptables-nft 2>/dev/null || true
+
+    # xt_addrtype / xt_conntrack live in kernel-modules-extra and MUST match the
+    # running kernel. A prior `dnf update` may have installed a newer kernel, so
+    # pin the package to $(uname -r); otherwise modprobe fails until reboot.
+    if ! rpm -q "kernel-modules-extra-${kver}" &>/dev/null; then
+        info "Installing kernel-modules-extra for running kernel ${kver}..."
+        dnf install -y -q "kernel-modules-extra-${kver}" 2>/dev/null \
+            || dnf install -y -q kernel-modules-extra 2>/dev/null \
+            || warn "Could not install kernel-modules-extra for ${kver}"
     fi
-    if [[ ${#_extra_pkgs[@]} -gt 0 ]]; then
-        info "Installing Docker prerequisites: ${_extra_pkgs[*]}..."
-        dnf install -y -q "${_extra_pkgs[@]}" 2>/dev/null || \
-            warn "Could not install all Docker prerequisites (${_extra_pkgs[*]})"
+
+    for _m in "${DOCKER_NF_MODULES[@]}"; do
+        modprobe "$_m" 2>/dev/null || true
+    done
+
+    # Verify the critical module is actually loadable on the running kernel.
+    if ! lsmod | grep -q '^xt_addrtype' && ! modprobe xt_addrtype 2>/dev/null; then
+        DOCKER_NEEDS_REBOOT=true
+        warn "xt_addrtype not available for running kernel ${kver}"
+        if rpm -q kernel 2>/dev/null | grep -qv "$kver"; then
+            warn "A newer kernel is installed — REBOOT required before Docker can start"
+        fi
     fi
 
-    modprobe br_netfilter 2>/dev/null || true
-    modprobe xt_addrtype 2>/dev/null || true
-
-    cat > /etc/modules-load.d/rahmat-docker.conf << 'EOF'
-overlay
-br_netfilter
-EOF
+    {
+        printf '%s\n' "${DOCKER_NF_MODULES[@]}"
+    } > /etc/modules-load.d/rahmat-docker.conf
     cat > /etc/sysctl.d/99-rahmat-docker-bridge.conf << 'EOF'
 net.bridge.bridge-nf-call-iptables = 1
 net.bridge.bridge-nf-call-ip6tables = 1
@@ -911,7 +925,6 @@ ensure_docker_running() {
 
     warn "Docker failed to start — running AlmaLinux/RHEL recovery..."
     prepare_docker_dnf_host
-    modprobe xt_addrtype 2>/dev/null || true
     systemctl restart containerd 2>/dev/null || true
     sleep 1
     systemctl restart docker 2>/dev/null || true
@@ -920,6 +933,15 @@ ensure_docker_running() {
     if systemctl is-active --quiet docker; then
         ok "Docker service started after recovery"
         return 0
+    fi
+
+    if [[ "$DOCKER_NEEDS_REBOOT" == "true" ]]; then
+        echo ""
+        warn "Docker cannot start until the host reboots into the updated kernel."
+        warn "Required netfilter modules (xt_addrtype/xt_conntrack) are missing for"
+        warn "the running kernel ($(uname -r)) but present for the installed kernel."
+        detail "Fix: ${BOLD}reboot${RESET} → Docker will start automatically (enabled)"
+        return 1
     fi
 
     echo ""
@@ -1822,6 +1844,10 @@ if docker info &>/dev/null 2>&1; then
     echo -e "  ${HACK}║${RESET}  Cgroup drv    ${HACK_DIM}:${RESET}  $(docker info --format '{{.CgroupDriver}}')"
     echo -e "  ${HACK}║${RESET}  Cgroup ver    ${HACK_DIM}:${RESET}  $(docker info --format '{{.CgroupVersion}}')"
     echo -e "  ${HACK}║${RESET}  Docker root   ${HACK_DIM}:${RESET}  $(docker info --format '{{.DockerRootDir}}')"
+elif [[ "${DOCKER_NEEDS_REBOOT:-false}" == "true" ]]; then
+    echo -e "  ${HACK}║${RESET}  Status        ${HACK_DIM}:${RESET}  ${HACK_WARN}pending reboot${RESET}"
+    echo -e "  ${HACK}║${RESET}  Reason        ${HACK_DIM}:${RESET}  kernel modules need new kernel"
+    echo -e "  ${HACK}║${RESET}  Fix           ${HACK_DIM}:${RESET}  ${BOLD}reboot${RESET} (docker is enabled)"
 else
     echo -e "  ${HACK}║${RESET}  Status        ${HACK_DIM}:${RESET}  ${HACK_ERR}offline — check logs${RESET}"
     echo -e "  ${HACK}║${RESET}  Debug         ${HACK_DIM}:${RESET}  journalctl -xeu docker.service"
@@ -1923,8 +1949,13 @@ fi
 
 echo -e "  ${HACK}[+]${RESET} ${BOLD}NODE CLEARED :: DNS SAAS DEPLOYMENT READY${RESET}"
 echo ""
-echo -e "  ${HACK_WARN}[!]${RESET}  REBOOT RECOMMENDED — kernel params pending full apply"
-echo -e "  ${HACK}[>]${RESET}  ${BOLD}reboot${RESET}"
+if [[ "${DOCKER_NEEDS_REBOOT:-false}" == "true" ]]; then
+    echo -e "  ${HACK_ERR}[!]${RESET}  ${BOLD}REBOOT REQUIRED${RESET} — Docker needs the updated kernel's netfilter modules"
+    echo -e "  ${HACK}[>]${RESET}  ${BOLD}reboot${RESET}  ${HACK_DIM}# docker.service will start automatically${RESET}"
+else
+    echo -e "  ${HACK_WARN}[!]${RESET}  REBOOT RECOMMENDED — kernel params pending full apply"
+    echo -e "  ${HACK}[>]${RESET}  ${BOLD}reboot${RESET}"
+fi
 echo ""
 echo -e "  ${HACK_MUTED}RAHMAT // ${GITHUB_URL} // $(date '+%Y')${RESET}"
 echo ""
