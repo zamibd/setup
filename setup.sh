@@ -106,13 +106,35 @@ apply_config_defaults() {
     : "${F2B_RECIDIVE_MAXRETRY:=2}"
 }
 
-# Load config: .env beside script → /etc/rahmat/.env → defaults
-if [[ ! -f "$ENV_FILE" ]] && [[ -f "${SCRIPT_DIR}/.env.example" ]]; then
-    cp "${SCRIPT_DIR}/.env.example" "$ENV_FILE"
-fi
-load_dotenv "$ENV_FILE" || true
-load_dotenv "/etc/rahmat/.env" || true
-apply_config_defaults
+ENV_JUST_CREATED=false
+
+reload_config() {
+    load_dotenv "$ENV_FILE" || true
+    load_dotenv "/etc/rahmat/.env" || true
+    apply_config_defaults
+}
+
+ensure_env_file() {
+    if [[ -f "$ENV_FILE" ]]; then
+        return 0
+    fi
+    if [[ -f "${SCRIPT_DIR}/.env.example" ]]; then
+        cp "${SCRIPT_DIR}/.env.example" "$ENV_FILE"
+        ENV_JUST_CREATED=true
+        return 0
+    fi
+    if command -v curl &>/dev/null; then
+        if curl -fsSL "https://raw.githubusercontent.com/zamibd/setup/main/.env.example" -o "$ENV_FILE"; then
+            ENV_JUST_CREATED=true
+            return 0
+        fi
+    fi
+    fail "No ${ENV_FILE} found. Run: curl -fsSL …/.env.example -o .env && nano .env"
+}
+
+# Bootstrap .env before first load (full reload after optional nano edit)
+ensure_env_file
+reload_config
 
 TOTAL_STEPS=15
 
@@ -653,12 +675,40 @@ print_final_summary() {
 
 banner
 
+# ── Pre-flight — edit .env (SSH key, whitelist, etc.) ───────────
+echo ""
+echo -e "  ${HACK}[CONFIG]${RESET}  ${BOLD}>> Review ${ENV_FILE} before install${RESET}"
+echo -e "  ${HACK_MUTED}$(printf '%.0s-' {1..50})${RESET}"
+if [[ "$ENV_JUST_CREATED" == "true" ]]; then
+    ok "Created ${ENV_FILE} from .env.example"
+else
+    ok "Using ${ENV_FILE}"
+fi
+detail "Set SSH_PUBLIC_KEY and SSH_WHITELIST_IPS in .env — phase 10 does not prompt"
+
+if is_interactive; then
+    echo ""
+    info "Opening editor — set SSH_PUBLIC_KEY, save, and exit nano to continue"
+    echo -e "  ${HACK}[>]${RESET}  ${BOLD}nano ${ENV_FILE}${RESET}"
+    if command -v nano &>/dev/null; then
+        nano "$ENV_FILE"
+    elif [[ -n "${EDITOR:-}" ]]; then
+        "$EDITOR" "$ENV_FILE"
+    else
+        vi "$ENV_FILE"
+    fi
+    echo ""
+    reload_config
+    ok "Config reloaded from ${ENV_FILE}"
+elif [[ -z "${SSH_PUBLIC_KEY:-}" ]]; then
+    warn "Non-interactive run with empty SSH_PUBLIC_KEY — set it in ${ENV_FILE} or /etc/rahmat/.env"
+fi
+
 # Sync .env to system path
 install -d -m 750 /etc/rahmat
 if [[ -f "$ENV_FILE" ]]; then
     install -m 640 "$ENV_FILE" /etc/rahmat/.env
-    ok "Config loaded → ${ENV_FILE}"
-    detail "System copy : /etc/rahmat/.env"
+    ok "Config synced → /etc/rahmat/.env"
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -1204,16 +1254,11 @@ SSHD_DROPIN="/etc/ssh/sshd_config.d/99-rahmat.conf"
 SSH_USER="${SSH_USER:-root}"
 SSH_PUBKEY="${SSH_PUBLIC_KEY:-}"
 
-if is_interactive; then
-    ask_line "SSH user for key auth [${SSH_USER}]:" SSH_USER_INPUT
-    [[ -n "$SSH_USER_INPUT" ]] && SSH_USER="$SSH_USER_INPUT"
-fi
+detail "SSH settings from .env — user: ${SSH_USER}"
+
 SSH_HOME=$(getent passwd "$SSH_USER" | cut -d: -f6)
 [[ -n "$SSH_HOME" ]] || fail "SSH user '$SSH_USER' not found"
 
-if [[ -z "$SSH_PUBKEY" ]] && is_interactive; then
-    ask_line "Paste SSH public key (Enter to skip):" SSH_PUBKEY
-fi
 if [[ -n "$SSH_PUBKEY" ]]; then
     if valid_ssh_pubkey "$SSH_PUBKEY"; then
         install -d -m 700 -o "$SSH_USER" -g "$SSH_USER" "${SSH_HOME}/.ssh"
@@ -1236,9 +1281,6 @@ else
 fi
 
 WHITELIST_INPUT="${SSH_WHITELIST_IPS:-}"
-if [[ -z "$WHITELIST_INPUT" ]] && is_interactive; then
-    ask_line "SSH allowed IPs/CIDRs, comma-separated (Enter = any):" WHITELIST_INPUT
-fi
 if [[ -n "$WHITELIST_INPUT" ]]; then
     IFS=',' read -ra _wl_parts <<< "$WHITELIST_INPUT"
     for ip in "${_wl_parts[@]}"; do
@@ -1272,13 +1314,13 @@ else
     ok "SSH open on port 22 (no whitelist configured)"
 fi
 
-DISABLE_PASSWORD="no"
+PASSWORD_AUTHENTICATION="yes"
 if [[ "$SSH_DISABLE_PASSWORD" == "yes" ]]; then
-    DISABLE_PASSWORD="yes"
+    PASSWORD_AUTHENTICATION="no"
 elif [[ "$SSH_DISABLE_PASSWORD" == "no" ]]; then
-    DISABLE_PASSWORD="no"
+    PASSWORD_AUTHENTICATION="yes"
 elif [[ -n "$SSH_PUBKEY" ]]; then
-    DISABLE_PASSWORD="yes"
+    PASSWORD_AUTHENTICATION="no"
 fi
 
 if [[ "$SSH_USER" == "root" ]]; then
@@ -1297,7 +1339,7 @@ cat > "$SSHD_DROPIN" << EOF
 Port ${SSH_PORT}
 PermitRootLogin ${ROOT_LOGIN}
 PubkeyAuthentication yes
-PasswordAuthentication ${DISABLE_PASSWORD}
+PasswordAuthentication ${PASSWORD_AUTHENTICATION}
 PermitEmptyPasswords no
 KbdInteractiveAuthentication no
 UsePAM yes
@@ -1313,7 +1355,7 @@ EOF
 
 sshd_test_and_reload
 ok "SSH hardening applied → ${SSHD_DROPIN}"
-detail "Password auth : ${DISABLE_PASSWORD}"
+detail "Password auth : ${PASSWORD_AUTHENTICATION}"
 detail "AllowUsers    : ${SSH_USER}"
 
 # ────────────────────────────────────────────────────────────────
