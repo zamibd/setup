@@ -89,6 +89,7 @@ apply_config_defaults() {
     : "${SSH_USER:=root}"
     : "${SSH_PUBLIC_KEY:=}"
     : "${SSH_WHITELIST_IPS:=}"
+    : "${SSH_OPEN_PUBLIC:=false}"
     : "${SSH_DISABLE_PASSWORD:=auto}"
     : "${SSH_MAX_AUTH_TRIES:=3}"
     : "${SSH_LOGIN_GRACE_TIME:=30}"
@@ -109,8 +110,8 @@ apply_config_defaults() {
 ENV_JUST_CREATED=false
 
 reload_config() {
-    load_dotenv "$ENV_FILE" || true
     load_dotenv "/etc/rahmat/.env" || true
+    load_dotenv "$ENV_FILE" || true
     apply_config_defaults
 }
 
@@ -201,6 +202,119 @@ valid_ip_or_cidr() {
 valid_ssh_pubkey() {
     local key="$1"
     [[ "$key" =~ ^(ssh-(rsa|ed25519|ecdsa)|ecdsa-sha2-nistp256)[[:space:]]+[A-Za-z0-9+/=]+ ]]
+}
+
+capture_ssh_client_ip() {
+    CURRENT_SSH_IP=""
+    [[ -n "${SSH_CONNECTION:-}" ]] && CURRENT_SSH_IP="${SSH_CONNECTION%% *}"
+}
+
+normalize_whitelist_entry() {
+    local ip="$1"
+    [[ "$ip" == */* ]] && printf '%s' "$ip" || printf '%s/32' "$ip"
+}
+
+parse_ssh_whitelist() {
+    local input="${1:-}" part ip
+    SSH_WHITELIST=()
+    [[ -z "$input" ]] && return 0
+    IFS=',' read -ra _wl_parts <<< "$input"
+    for part in "${_wl_parts[@]}"; do
+        ip="${part// /}"
+        [[ -z "$ip" ]] && continue
+        if valid_ip_or_cidr "$ip"; then
+            SSH_WHITELIST+=("$(normalize_whitelist_entry "$ip")")
+        else
+            warn "Invalid IP/CIDR skipped: $ip"
+        fi
+    done
+}
+
+current_ip_in_whitelist() {
+    local ip="$1" entry base
+    [[ -z "$ip" ]] && return 1
+    for entry in "${SSH_WHITELIST[@]}"; do
+        [[ "$entry" == "$ip" || "$entry" == "${ip}/32" ]] && return 0
+        base="${entry%%/*}"
+        [[ "$entry" != */* && "$base" == "$ip" ]] && return 0
+    done
+    return 1
+}
+
+validate_preflight_ssh() {
+    local _key="${SSH_PUBLIC_KEY:-}"
+    if [[ -n "$_key" ]] && ! valid_ssh_pubkey "$_key"; then
+        fail "SSH_PUBLIC_KEY in ${ENV_FILE} is invalid — fix before continuing"
+    fi
+    if [[ "$SSH_DISABLE_PASSWORD" == "yes" && -z "$_key" ]]; then
+        fail "SSH_DISABLE_PASSWORD=yes requires a valid SSH_PUBLIC_KEY in ${ENV_FILE}"
+    fi
+    if [[ "$SSH_DISABLE_PASSWORD" == "no" && -z "$_key" ]]; then
+        warn "No SSH_PUBLIC_KEY — password login will stay enabled for ${SSH_USER}"
+    fi
+    if [[ -z "${SSH_WHITELIST_IPS:-}" && "$SSH_OPEN_PUBLIC" != "true" && -z "$CURRENT_SSH_IP" ]]; then
+        warn "SSH_WHITELIST_IPS empty and not connected via SSH — port ${SSH_PORT} will be blocked"
+    fi
+}
+
+ssh_firewall_rich_rule() {
+    printf 'rule family="ipv4" source ipset="%s" port port="%s" protocol="tcp" accept' \
+        "$SSH_IPSET_NAME" "$SSH_PORT"
+}
+
+reset_ssh_firewall_state() {
+    local _rule _old
+    _rule=$(ssh_firewall_rich_rule)
+    firewall-cmd --permanent --remove-rich-rule="${_rule}" > /dev/null 2>&1 || true
+    while IFS= read -r _old; do
+        [[ -n "$_old" ]] || continue
+        firewall-cmd --permanent --remove-rich-rule="${_old}" > /dev/null 2>&1 || true
+    done < <(firewall-cmd --permanent --list-rich-rules 2>/dev/null | \
+        grep -E "port port=\"?${SSH_PORT}\"?.*protocol=\"?tcp\"?.*accept" || true)
+    firewall-cmd --permanent --delete-ipset="${SSH_IPSET_NAME}" > /dev/null 2>&1 || true
+    firewall-cmd --permanent --remove-port="${SSH_PORT}/tcp" > /dev/null 2>&1 || true
+    firewall-cmd --permanent --remove-service=ssh > /dev/null 2>&1 || true
+}
+
+apply_ssh_firewall_rules() {
+    local ip _rule
+    SSH_IPSET_NAME="rahmat-ssh-allow"
+    capture_ssh_client_ip
+    parse_ssh_whitelist "${SSH_WHITELIST_IPS:-}"
+
+    if [[ ${#SSH_WHITELIST[@]} -eq 0 && -n "$CURRENT_SSH_IP" ]]; then
+        SSH_WHITELIST+=("$(normalize_whitelist_entry "$CURRENT_SSH_IP")")
+        warn "SSH_WHITELIST_IPS empty — auto-allowed current session ${SSH_WHITELIST[0]} (add your IP to .env)"
+    fi
+
+    reset_ssh_firewall_state
+
+    if [[ ${#SSH_WHITELIST[@]} -gt 0 ]]; then
+        detail "SSH whitelist: ${SSH_WHITELIST[*]}"
+        if [[ -n "$CURRENT_SSH_IP" ]] && ! current_ip_in_whitelist "$CURRENT_SSH_IP"; then
+            warn "Current session IP ${CURRENT_SSH_IP} NOT in whitelist — verify before disconnect!"
+        fi
+        firewall-cmd --permanent --new-ipset="${SSH_IPSET_NAME}" --type=hash:net > /dev/null 2>&1 || \
+            fail "Failed to create firewalld ipset ${SSH_IPSET_NAME}"
+        for ip in "${SSH_WHITELIST[@]}"; do
+            firewall-cmd --permanent --ipset="${SSH_IPSET_NAME}" --add-entry="${ip}" > /dev/null 2>&1 || \
+                fail "Failed to add ${ip} to ${SSH_IPSET_NAME}"
+            detail "firewalld allow SSH from ${ip} → port ${SSH_PORT}"
+        done
+        _rule=$(ssh_firewall_rich_rule)
+        firewall-cmd --permanent --add-rich-rule="${_rule}" > /dev/null 2>&1 || \
+            fail "Failed to add SSH whitelist rich rule"
+        SSH_FIREWALL_MODE="whitelist"
+        ok "SSH port ${SSH_PORT}/tcp restricted to ${#SSH_WHITELIST[@]} IP/CIDR rule(s)"
+    elif [[ "$SSH_OPEN_PUBLIC" == "true" ]]; then
+        firewall-cmd --permanent --add-port="${SSH_PORT}/tcp" > /dev/null 2>&1
+        SSH_FIREWALL_MODE="public"
+        warn "SSH port ${SSH_PORT}/tcp open to all IPs (SSH_OPEN_PUBLIC=true)"
+    else
+        SSH_FIREWALL_MODE="closed"
+        warn "SSH port ${SSH_PORT}/tcp blocked — set SSH_WHITELIST_IPS in .env or SSH_OPEN_PUBLIC=true"
+    fi
+    firewall-cmd --reload > /dev/null 2>&1
 }
 
 sshd_test_and_reload() {
@@ -508,8 +622,10 @@ apply_ddos_firewalld() {
 
 SSH_PUBKEY="${SSH_PUBLIC_KEY:-}"
 SSH_WHITELIST=()
+SSH_FIREWALL_MODE="closed"
+SSH_IPSET_NAME="rahmat-ssh-allow"
 CURRENT_SSH_IP=""
-[[ -n "${SSH_CONNECTION:-}" ]] && CURRENT_SSH_IP="${SSH_CONNECTION%% *}"
+capture_ssh_client_ip
 
 banner() {
     clear
@@ -632,7 +748,13 @@ print_final_summary() {
     echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD} 53${RESET}/udp  ${HACK_DIM}+${RESET}  ${BOLD}53${RESET}/tcp  ${HACK_DIM}→${RESET}  DNS Plain"
     echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD}853${RESET}/tcp ${HACK_DIM}→${RESET}  DoT (DNS-over-TLS)"
     echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD}443${RESET}/tcp ${HACK_DIM}→${RESET}  DoH (DNS-over-HTTPS)"
-    echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD} 22${RESET}/tcp ${HACK_DIM}→${RESET}  SSH (hardened)"
+    if [[ "$SSH_FIREWALL_MODE" == "whitelist" ]]; then
+        echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD} ${SSH_PORT}${RESET}/tcp ${HACK_DIM}→${RESET}  SSH (whitelist)"
+    elif [[ "$SSH_FIREWALL_MODE" == "public" ]]; then
+        echo -e "  ${HACK}║${RESET}  ${HACK_WARN}[!]${RESET}  ${BOLD} ${SSH_PORT}${RESET}/tcp ${HACK_DIM}→${RESET}  SSH (open to all)"
+    else
+        echo -e "  ${HACK}║${RESET}  ${HACK_ERR}[x]${RESET}  ${BOLD} ${SSH_PORT}${RESET}/tcp ${HACK_DIM}→${RESET}  SSH (blocked)"
+    fi
     echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD} 80${RESET}/tcp ${HACK_DIM}→${RESET}  HTTP / ACME"
     echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
     echo ""
@@ -684,7 +806,7 @@ if [[ "$ENV_JUST_CREATED" == "true" ]]; then
 else
     ok "Using ${ENV_FILE}"
 fi
-detail "Set SSH_PUBLIC_KEY and SSH_WHITELIST_IPS in .env — phase 10 does not prompt"
+detail "Set SSH_PUBLIC_KEY and SSH_WHITELIST_IPS in .env — port 22 is not open to the world by default"
 
 if is_interactive; then
     echo ""
@@ -700,9 +822,13 @@ if is_interactive; then
     echo ""
     reload_config
     ok "Config reloaded from ${ENV_FILE}"
-elif [[ -z "${SSH_PUBLIC_KEY:-}" ]]; then
-    warn "Non-interactive run with empty SSH_PUBLIC_KEY — set it in ${ENV_FILE} or /etc/rahmat/.env"
+else
+    [[ -z "${SSH_PUBLIC_KEY:-}" ]] && \
+        warn "Non-interactive run with empty SSH_PUBLIC_KEY — set it in ${ENV_FILE}"
 fi
+
+capture_ssh_client_ip
+validate_preflight_ssh
 
 # Sync .env to system path
 install -d -m 750 /etc/rahmat
@@ -1201,7 +1327,7 @@ echo ""
 open_port_firewalld "53/udp"  "DNS — Plain UDP (primary)"
 open_port_firewalld "53/tcp"  "DNS — Plain TCP (fallback)"
 open_port_firewalld "853/tcp" "DoT — DNS-over-TLS"
-open_port_firewalld "22/tcp"  "SSH — Admin Access (restricted in phase 10)"
+detail "SSH port ${SSH_PORT}/tcp deferred to phase 10 (whitelist or SSH_OPEN_PUBLIC)"
 open_port_firewalld "80/tcp"  "HTTP — ACME / Certificate Renewal"
 open_port_firewalld "443/tcp" "HTTPS — DoH (DNS-over-HTTPS)"
 firewall-cmd --permanent --add-icmp-block=echo-request > /dev/null 2>&1 || true
@@ -1280,39 +1406,7 @@ else
     warn "No SSH key provided — password auth will remain enabled"
 fi
 
-WHITELIST_INPUT="${SSH_WHITELIST_IPS:-}"
-if [[ -n "$WHITELIST_INPUT" ]]; then
-    IFS=',' read -ra _wl_parts <<< "$WHITELIST_INPUT"
-    for ip in "${_wl_parts[@]}"; do
-        ip="${ip// /}"
-        [[ -z "$ip" ]] && continue
-        if valid_ip_or_cidr "$ip"; then
-            SSH_WHITELIST+=("$ip")
-        else
-            warn "Invalid IP/CIDR skipped: $ip"
-        fi
-    done
-fi
-
-if [[ ${#SSH_WHITELIST[@]} -gt 0 ]]; then
-    detail "SSH whitelist: ${SSH_WHITELIST[*]}"
-    if [[ -n "$CURRENT_SSH_IP" ]]; then
-        _wl_ok=false
-        for ip in "${SSH_WHITELIST[@]}"; do
-            [[ "$ip" == "$CURRENT_SSH_IP" || "$ip" == "${CURRENT_SSH_IP}/32" ]] && _wl_ok=true
-        done
-        $_wl_ok || warn "Current session IP ${CURRENT_SSH_IP} NOT in whitelist — verify before disconnect!"
-    fi
-    firewall-cmd --permanent --remove-port=22/tcp > /dev/null 2>&1 || true
-    for ip in "${SSH_WHITELIST[@]}"; do
-        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${ip}' port port='22' protocol='tcp' accept" > /dev/null 2>&1
-        detail "firewalld allow SSH from $ip"
-    done
-    firewall-cmd --reload > /dev/null 2>&1
-    ok "SSH restricted to ${#SSH_WHITELIST[@]} IP/CIDR rule(s)"
-else
-    ok "SSH open on port 22 (no whitelist configured)"
-fi
+apply_ssh_firewall_rules
 
 PASSWORD_AUTHENTICATION="yes"
 if [[ "$SSH_DISABLE_PASSWORD" == "yes" ]]; then
@@ -1368,6 +1462,10 @@ mkdir -p /etc/fail2ban/jail.d
 
 F2B_BANACTION="firewallcmd-rich-rules"
 F2B_BACKEND="systemd"
+F2B_IGNOREIP="127.0.0.1/8 ::1"
+for _f2b_ip in "${SSH_WHITELIST[@]}"; do
+    F2B_IGNOREIP+=" ${_f2b_ip}"
+done
 
 cat > "$F2B_JAIL" << EOF
 # RAHMAT — Fail2Ban jails (from .env)
@@ -1377,10 +1475,11 @@ findtime = ${F2B_DEFAULT_FINDTIME}
 maxretry = ${F2B_DEFAULT_MAXRETRY}
 banaction = ${F2B_BANACTION}
 backend = ${F2B_BACKEND}
+ignoreip = ${F2B_IGNOREIP}
 
 [sshd]
 enabled  = true
-port     = ssh
+port     = ${SSH_PORT}
 filter   = sshd
 mode     = ${F2B_SSHD_MODE}
 maxretry = ${F2B_SSHD_MAXRETRY}
@@ -1698,10 +1797,12 @@ echo -e "  ${HACK}╔══[SEC] HARDENING & DDoS ══════════
 echo -e "  ${HACK}║${RESET}  SSH config    ${HACK_DIM}:${RESET}  ${SSHD_DROPIN:-/etc/ssh/sshd_config.d/99-rahmat.conf}"
 echo -e "  ${HACK}║${RESET}  SSH user      ${HACK_DIM}:${RESET}  ${SSH_USER}"
 echo -e "  ${HACK}║${RESET}  SSH key       ${HACK_DIM}:${RESET}  $([[ -n "$SSH_PUBKEY" ]] && echo installed || echo not set)"
-if [[ ${#SSH_WHITELIST[@]} -gt 0 ]]; then
-    echo -e "  ${HACK}║${RESET}  SSH whitelist ${HACK_DIM}:${RESET}  ${SSH_WHITELIST[*]}"
+if [[ "$SSH_FIREWALL_MODE" == "whitelist" ]]; then
+    echo -e "  ${HACK}║${RESET}  SSH firewall  ${HACK_DIM}:${RESET}  whitelist → ${SSH_WHITELIST[*]}"
+elif [[ "$SSH_FIREWALL_MODE" == "public" ]]; then
+    echo -e "  ${HACK}║${RESET}  SSH firewall  ${HACK_DIM}:${RESET}  ${HACK_WARN}port ${SSH_PORT} open to all${RESET}"
 else
-    echo -e "  ${HACK}║${RESET}  SSH whitelist ${HACK_DIM}:${RESET}  ${HACK_DIM}any (port 22 open)${RESET}"
+    echo -e "  ${HACK}║${RESET}  SSH firewall  ${HACK_DIM}:${RESET}  ${HACK_ERR}port ${SSH_PORT} blocked${RESET}"
 fi
 echo -e "  ${HACK}║${RESET}  Fail2Ban      ${HACK_DIM}:${RESET}  ${F2B_JAIL:-/etc/fail2ban/jail.d/rahmat.local}"
 echo -e "  ${HACK}║${RESET}  DDoS rules    ${HACK_DIM}:${RESET}  ${DDOS_SCRIPT:-/etc/rahmat/apply-ddos-rules.sh}"
@@ -1722,7 +1823,13 @@ FW_STATE=$(systemctl is-active firewalld 2>/dev/null || echo "unknown")
 
 echo -e "  ${HACK}╔══[NET] FIREWALL :: ${FW_NAME} ═══════════════════════╗${RESET}"
 echo -e "  ${HACK}║${RESET}  Status     ${HACK_DIM}:${RESET}  ${HACK}${FW_STATE}${RESET}"
-echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD}  22${RESET}/tcp  ${HACK_DIM}::${RESET}  SSH"
+if [[ "$SSH_FIREWALL_MODE" == "whitelist" ]]; then
+    echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD} ${SSH_PORT}${RESET}/tcp  ${HACK_DIM}::${RESET}  SSH (whitelist only)"
+elif [[ "$SSH_FIREWALL_MODE" == "public" ]]; then
+    echo -e "  ${HACK}║${RESET}  ${HACK_WARN}[!]${RESET}  ${BOLD} ${SSH_PORT}${RESET}/tcp  ${HACK_DIM}::${RESET}  SSH (open to all)"
+else
+    echo -e "  ${HACK}║${RESET}  ${HACK_ERR}[x]${RESET}  ${BOLD} ${SSH_PORT}${RESET}/tcp  ${HACK_DIM}::${RESET}  SSH (blocked)"
+fi
 echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD}  53${RESET}/tcp  ${HACK_DIM}::${RESET}  DNS Plain TCP"
 echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD}  53${RESET}/udp  ${HACK_DIM}::${RESET}  DNS Plain UDP"
 echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD}  80${RESET}/tcp  ${HACK_DIM}::${RESET}  HTTP / ACME"
