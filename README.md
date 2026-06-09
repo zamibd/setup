@@ -4,7 +4,7 @@ Production-oriented Linux host bootstrap for **DNS SaaS** nodes. Prepares the OS
 
 | | |
 |---|---|
-| **Version** | `2.7.0` |
+| **Version** | `3.0.0` |
 | **Script** | `setup.sh` |
 | **Config** | `.env` → `/etc/rahmat/.env` |
 | **Author** | [RAHMAT](https://github.com/zamibd/setup) |
@@ -14,20 +14,22 @@ Production-oriented Linux host bootstrap for **DNS SaaS** nodes. Prepares the OS
 
 ## One-click install
 
-> Requires **root**. Test on staging first. Review `.env` before production.
+> Requires **root** (or `sudo`). Test on staging first. Review `.env` before production.
 
 ### curl (recommended — download + run)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zamibd/setup/main/setup.sh -o setup.sh && \
 curl -fsSL https://raw.githubusercontent.com/zamibd/setup/main/.env.example -o .env && \
-chmod +x setup.sh && sudo bash setup.sh
+chmod +x setup.sh && bash setup.sh
 ```
+
+Use `sudo bash setup.sh` if you are not root.
 
 ### curl (pipe — fastest)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zamibd/setup/main/setup.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/zamibd/setup/main/setup.sh | bash
 ```
 
 ### wget (download + run)
@@ -35,13 +37,13 @@ curl -fsSL https://raw.githubusercontent.com/zamibd/setup/main/setup.sh | sudo b
 ```bash
 wget -qO setup.sh https://raw.githubusercontent.com/zamibd/setup/main/setup.sh && \
 wget -qO .env https://raw.githubusercontent.com/zamibd/setup/main/.env.example && \
-chmod +x setup.sh && sudo bash setup.sh
+chmod +x setup.sh && bash setup.sh
 ```
 
 ### wget (pipe)
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/zamibd/setup/main/setup.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/zamibd/setup/main/setup.sh | bash
 ```
 
 ### Copy-paste URLs
@@ -60,41 +62,31 @@ If your default branch is not `main`, replace `main` with `master` in the URLs a
 
 | OS | Versions | Package manager | Firewall |
 |----|----------|-----------------|----------|
-| **Ubuntu** | 22.04+ (LTS & interim) | `apt` | UFW |
-| **Debian** | All stable/testing | `apt` | UFW |
-| **AlmaLinux** | All (8, 9, 10+) | `dnf` | firewalld |
-| **Rocky Linux** | All | `dnf` | firewalld |
-| **RHEL** | 8, 9, 10+ | `dnf` | firewalld |
-| **CentOS Stream** | All | `dnf` | firewalld |
-| **Oracle Linux** | All | `dnf` | firewalld |
-| **Fedora** | Current releases | `dnf` | firewalld |
+| **AlmaLinux** | 8, 9, 10+ | `dnf` | firewalld |
 
-**Ubuntu-based derivatives** (Mint, Pop!\_OS, Zorin, Kubuntu, etc.) — Ubuntu 22.04+ base required.
-
-**Debian-based derivatives** (Kali, Parrot, Devuan, etc.) — supported via Debian path.
-
-**Architecture:** `x86_64` / `amd64` (primary). ARM64 where Docker CE repos exist for your distro.
+**Architecture:** `x86_64` / `amd64` (primary). ARM64 where Docker CE repos exist for AlmaLinux.
 
 ---
 
-## What the installer does (14 phases)
+## What the installer does (15 phases)
 
 | Phase | Title | Summary |
 |-------|--------|---------|
-| 01 | OS Detection | Detects distro, Docker repo suite, family |
-| 02 | System Update | `apt upgrade` / `dnf update` + EPEL (RHEL family) |
+| 01 | OS Detection | Verifies AlmaLinux, Docker repo, family |
+| 02 | System Update | `dnf update` + EPEL |
 | 03 | Essential Packages | curl, git, fail2ban, firewall tools, build deps |
 | 04 | Docker | Docker CE, Compose plugin, `daemon.json` |
 | 05 | Timezone | Sets timezone from `.env` (default `Asia/Dhaka`) |
 | 06 | Swap & Limits | swapfile + `limits.conf` (nofile/nproc) |
-| 07 | Kernel Tuning | DNS/DoT sysctl (53 udp/tcp, 853 tcp) |
-| 08 | Firewall | Opens service ports, blocks ICMP ping |
+| 07 | Kernel Tuning | DNS/DoT sysctl (53 udp/tcp, 853 tcp) + TCP BBR |
+| 08 | Firewall | Opens service ports, blocks ICMP ping (firewalld) |
 | 09 | DDoS Protection | iptables rate limits + `rahmat-ddos.service` |
 | 10 | SSH Hardening | Keys, whitelist, `sshd` drop-in |
 | 11 | Fail2Ban | `sshd` + `recidive` jails |
-| 12 | SELinux | DNS/Docker booleans (RHEL family only) |
-| 13 | Auto Updates | `unattended-upgrades` / `dnf-automatic` |
+| 12 | SELinux | DNS/Docker booleans |
+| 13 | Auto Updates | `dnf-automatic` |
 | 14 | Free Port 53 | Stops systemd-resolved, static `resolv.conf` |
+| 15 | Perf & Hardening | THP off, CPU governor, chrony, auditd, unused services |
 
 ---
 
@@ -107,10 +99,11 @@ Services **enabled/started** or **configured** by the installer:
 | `docker` | Container runtime | `systemctl status docker` |
 | `rahmat-ddos.service` | DDoS iptables rules (boot) | `systemctl status rahmat-ddos` |
 | `fail2ban` | SSH brute-force protection | `systemctl status fail2ban` |
-| `ufw` | Firewall (Debian/Ubuntu) | `ufw status` |
-| `firewalld` | Firewall (RHEL family) | `systemctl status firewalld` |
-| `unattended-upgrades` | Auto security patches (apt) | `systemctl status unattended-upgrades` |
-| `dnf-automatic.timer` | Auto security patches (dnf) | `systemctl status dnf-automatic.timer` |
+| `firewalld` | Firewall | `systemctl status firewalld` |
+| `dnf-automatic.timer` | Auto security patches | `systemctl status dnf-automatic.timer` |
+| `chronyd` | Accurate NTP time (TLS/logs) | `systemctl status chronyd` |
+| `auditd` | Config change auditing | `systemctl status auditd` |
+| `rahmat-cpugovernor.service` | CPU performance governor at boot | `systemctl status rahmat-cpugovernor` |
 | `ssh` / `sshd` | SSH (hardened drop-in) | `systemctl status sshd` |
 
 **Reload DDoS rules only** (after editing `.env`):
@@ -137,6 +130,8 @@ sudo systemctl restart rahmat-ddos
 | `/etc/ssh/sshd_config.d/99-rahmat.conf` | SSH hardening |
 | `/etc/fail2ban/jail.d/rahmat.local` | Fail2Ban jails |
 | `/etc/modules-load.d/rahmat-dns.conf` | conntrack/hashlimit modules |
+| `/etc/tmpfiles.d/rahmat-thp.conf` | Disable transparent huge pages |
+| `/etc/audit/rules.d/rahmat.rules` | auditd watches (SSH, rahmat, firewall) |
 
 ---
 
@@ -167,19 +162,13 @@ Tuned for **~1000 mobile DoT users** (CGNAT-friendly):
 | DoH 443 | 80/sec per IP | 160 | — |
 | SYN (global) | 2000/sec | 4000 | — |
 
-Edit in `.env`, then re-run `setup.sh` or `systemctl restart rahmat-ddos`.
+Edit in `.env`, then re-run `setup.sh` or restart DDoS rules (`systemctl restart rahmat-ddos`).
 
 ---
 
 ## Packages installed
 
-### Debian / Ubuntu (`apt`)
-
-`curl` `wget` `git` `ufw` `fail2ban` `iptables` `ipset` `unattended-upgrades` `ca-certificates` `gnupg` `lsb-release` `htop` `net-tools` `make` `build-essential` + **Docker CE** stack
-
-### RHEL family (`dnf`)
-
-`curl` `wget` `git` `fail2ban` `iptables` `ipset` `dnf-automatic` `ca-certificates` `gnupg2` `htop` `net-tools` `make` `gcc` `gcc-c++` `firewalld` `dnf-plugins-core` `policycoreutils-python-utils` + **Docker CE** stack
+`curl` `wget` `git` `nano` `fail2ban` `iptables` `ipset` `dnf-automatic` `chrony` `audit` `kernel-tools` `ca-certificates` `gnupg2` `htop` `net-tools` `make` `gcc` `gcc-c++` `firewalld` `dnf-plugins-core` `policycoreutils-python-utils` + **Docker CE** stack
 
 ---
 
@@ -266,4 +255,4 @@ This script prepares the **host**. Deploy your DNS SaaS stack on Docker after se
 
 ---
 
-**RAHMAT DNS-INFRA · v2.7.0 · DNS 53 · DoT 853 · DoH 443**
+**RAHMAT DNS-INFRA · v3.0.0 · DNS 53 · DoT 853 · DoH 443**
