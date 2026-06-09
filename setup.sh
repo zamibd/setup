@@ -154,8 +154,6 @@ step() {
     echo -e "  ${HACK_MUTED}$(printf '%.0s-' {1..50})${RESET}"
 }
 
-GITHUB_URL="${GITHUB_URL}"
-
 # ── Interactive / validation helpers ─────────────────────────────
 is_interactive() {
     [[ "${INTERACTIVE_PROMPTS}" == "true" ]] && [[ -t 0 ]]
@@ -531,6 +529,10 @@ _svc_status_icon() {
     fi
 }
 
+_chrony_active() {
+    svc_is_active chronyd || svc_is_active chrony
+}
+
 print_final_summary() {
     local _host _installed _docker_st _fw_st _f2b_st _ddos_st _chr_st _aud_st
     local _ports_ok=0 _ports_total=3 _spec _p _pr
@@ -595,7 +597,7 @@ print_final_summary() {
     echo -e "  ${HACK}║${RESET}  $(_svc_status_icon fail2ban)  fail2ban      ${HACK_DIM}:${RESET}  $([[ "$_f2b_st" == active ]] && echo -e "${HACK}${_f2b_st}${RESET}" || echo -e "${HACK_ERR}${_f2b_st}${RESET}")"
     echo -e "  ${HACK}║${RESET}  $(_svc_status_icon rahmat-ddos)  rahmat-ddos   ${HACK_DIM}:${RESET}  $([[ "$_ddos_st" == active ]] && echo -e "${HACK}${_ddos_st}${RESET}" || echo -e "${HACK_WARN}${_ddos_st}${RESET}")"
     if [[ "$HARDEN_CHRONY" == "true" ]]; then
-        echo -e "  ${HACK}║${RESET}  $(_svc_status_icon chronyd)  chronyd       ${HACK_DIM}:${RESET}  $([[ "$_chr_st" == active ]] && echo -e "${HACK}${_chr_st}${RESET}" || echo -e "${HACK_WARN}${_chr_st}${RESET}")"
+        echo -e "  ${HACK}║${RESET}  $(_chrony_active && echo -e "${HACK}[+]${RESET}" || echo -e "${HACK_ERR}[x]${RESET}")  chronyd       ${HACK_DIM}:${RESET}  $([[ "$_chr_st" == active ]] && echo -e "${HACK}${_chr_st}${RESET}" || echo -e "${HACK_WARN}${_chr_st}${RESET}")"
     fi
     if [[ "$HARDEN_AUDITD" == "true" ]]; then
         echo -e "  ${HACK}║${RESET}  $(_svc_status_icon auditd)  auditd        ${HACK_DIM}:${RESET}  $([[ "$_aud_st" == active ]] && echo -e "${HACK}${_aud_st}${RESET}" || echo -e "${HACK_WARN}${_aud_st}${RESET}")"
@@ -1149,7 +1151,7 @@ echo ""
 open_port_firewalld "53/udp"  "DNS — Plain UDP (primary)"
 open_port_firewalld "53/tcp"  "DNS — Plain TCP (fallback)"
 open_port_firewalld "853/tcp" "DoT — DNS-over-TLS"
-open_port_firewalld "22/tcp"  "SSH — Admin Access (restricted in phase 09)"
+open_port_firewalld "22/tcp"  "SSH — Admin Access (restricted in phase 10)"
 open_port_firewalld "80/tcp"  "HTTP — ACME / Certificate Renewal"
 open_port_firewalld "443/tcp" "HTTPS — DoH (DNS-over-HTTPS)"
 firewall-cmd --permanent --add-icmp-block=echo-request > /dev/null 2>&1 || true
@@ -1280,7 +1282,12 @@ elif [[ -n "$SSH_PUBKEY" ]]; then
 fi
 
 if [[ "$SSH_USER" == "root" ]]; then
-    ROOT_LOGIN="prohibit-password"
+    if [[ -n "$SSH_PUBKEY" ]]; then
+        ROOT_LOGIN="prohibit-password"
+    else
+        ROOT_LOGIN="yes"
+        warn "No SSH key installed — root password login kept enabled (set SSH_PUBLIC_KEY before re-run)"
+    fi
 else
     ROOT_LOGIN="no"
 fi
@@ -1544,7 +1551,7 @@ if [[ "$HARDEN_DISABLE_UNUSED_SERVICES" == "true" ]]; then
     info "Disabling unused services..."
     _disabled=0
     for _svc in avahi-daemon cups bluetooth; do
-        if systemctl list-unit-files "${_svc}.service" &>/dev/null 2>&1; then
+        if systemctl cat "${_svc}.service" &>/dev/null; then
             if systemctl is-enabled --quiet "${_svc}.service" 2>/dev/null; then
                 systemctl disable --now "${_svc}.service" > /dev/null 2>&1 || true
                 detail "disabled: ${_svc}"
@@ -1554,7 +1561,11 @@ if [[ "$HARDEN_DISABLE_UNUSED_SERVICES" == "true" ]]; then
             fi
         fi
     done
-    [[ $_disabled -gt 0 ]] && ok "${_disabled} unused service(s) disabled" || ok "No unused services needed disabling"
+    if [[ $_disabled -gt 0 ]]; then
+        ok "${_disabled} unused service(s) disabled"
+    else
+        ok "No unused services needed disabling"
+    fi
 else
     skip "unused service cleanup (HARDEN_DISABLE_UNUSED_SERVICES=false)"
 fi
