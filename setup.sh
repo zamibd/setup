@@ -21,6 +21,13 @@ fi
 
 set -euo pipefail
 
+SCRIPT_NAME="RAHMAT"
+SCRIPT_PRODUCT="DNS-INFRA"
+SCRIPT_VERSION="3.0.0"
+SCRIPT_AUTHOR="RAHMAT"
+SCRIPT_REPO="https://github.com/zamibd/setup"
+SCRIPT_PLATFORM="AlmaLinux 8 · 9 · 10+"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/.env}"
 
@@ -490,7 +497,7 @@ banner() {
     echo -e "${HACK_DIM}[!] initialising payload...${RESET}"
     echo -e "${HACK}${BOLD}"
     echo '  ┌──────────────────────────────────────────────────────────┐'
-    echo '  │ 0x5241484D4154 :: RAHMAT :: DNS-INFRA :: v3.0.0          │'
+    echo "  │ 0x5241484D4154 :: ${SCRIPT_NAME} :: ${SCRIPT_PRODUCT} :: v${SCRIPT_VERSION}          │"
     echo '  ├──────────────────────────────────────────────────────────┤'
     echo '  │                                                          │'
     echo '  │   ####    ###   #   #  ## ##   ###   #####              │'
@@ -504,9 +511,134 @@ banner() {
     echo -e "${RESET}"
     echo -e "  ${HACK}[root@rahmat:~#]${RESET} ${HACK_DIM}./setup.sh --deploy-dns${RESET}"
     echo -e "  ${HACK_MUTED}[$]${RESET} ${GREEN}${GITHUB_URL}${RESET}"
-    echo -e "  ${HACK_MUTED}[#]${RESET} ${HACK_DIM}almalinux only${RESET}"
+    echo -e "  ${HACK_MUTED}[#]${RESET} ${HACK_DIM}${SCRIPT_PLATFORM}${RESET}"
     echo ""
     echo -e "  ${HACK_MUTED}$(printf '%.0s=' {1..58})${RESET}"
+    echo ""
+}
+
+_row() {
+    local icon="$1" name="$2" val="$3"
+    printf "  ${HACK}║${RESET}  %b  %-12s${HACK_DIM}:${RESET}  ${BWHITE}%s${RESET}\n" "$icon" "$name" "$val"
+}
+
+_svc_status_icon() {
+    local svc="$1"
+    if svc_is_active "$svc"; then
+        echo -e "${HACK}[+]${RESET}"
+    else
+        echo -e "${HACK_ERR}[x]${RESET}"
+    fi
+}
+
+print_final_summary() {
+    local _host _installed _docker_st _fw_st _f2b_st _ddos_st _chr_st _aud_st
+    local _ports_ok=0 _ports_total=3 _spec _p _pr
+
+    _host=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "unknown")
+    _installed=$(date '+%A, %d %B %Y  %H:%M:%S %Z')
+
+    if docker info &>/dev/null 2>&1; then
+        _docker_st="${HACK}online${RESET}"
+    elif [[ "${DOCKER_NEEDS_REBOOT:-false}" == "true" ]]; then
+        _docker_st="${HACK_WARN}pending reboot${RESET}"
+    else
+        _docker_st="${HACK_ERR}offline${RESET}"
+    fi
+
+    _fw_st=$(systemctl is-active firewalld 2>/dev/null || echo "inactive")
+    _f2b_st=$(systemctl is-active fail2ban 2>/dev/null || echo "inactive")
+    _ddos_st=$(systemctl is-active rahmat-ddos 2>/dev/null || echo "inactive")
+    _chr_st=$(systemctl is-active chronyd 2>/dev/null || systemctl is-active chrony 2>/dev/null || echo "inactive")
+    _aud_st=$(systemctl is-active auditd 2>/dev/null || echo "inactive")
+
+    for _spec in "53:udp" "53:tcp" "853:tcp"; do
+        IFS=: read -r _p _pr <<< "$_spec"
+        port_is_bound "$_p" "$_pr" || _ports_ok=$((_ports_ok + 1))
+    done
+
+    echo ""
+    echo -e "${HACK}${BOLD}"
+    echo '  ╔══════════════════════════════════════════════════════════╗'
+    echo '  ║                                                          ║'
+    printf '  ║%s║\n' "     ${SCRIPT_NAME} ${SCRIPT_PRODUCT} — INSTALLATION COMPLETE          "
+    echo '  ║                                                          ║'
+    echo '  ╠══════════════════════════════════════════════════════════╣'
+    echo -e "${RESET}"
+
+    echo -e "  ${HACK}╔══[META] PROJECT ══════════════════════════════════╗${RESET}"
+    echo -e "  ${HACK}║${RESET}  Name        ${HACK_DIM}:${RESET}  ${BWHITE}${SCRIPT_NAME} DNS SaaS Server Bootstrap${RESET}"
+    echo -e "  ${HACK}║${RESET}  Product     ${HACK_DIM}:${RESET}  ${BWHITE}${SCRIPT_PRODUCT}${RESET}"
+    echo -e "  ${HACK}║${RESET}  Version     ${HACK_DIM}:${RESET}  ${BWHITE}v${SCRIPT_VERSION}${RESET}"
+    echo -e "  ${HACK}║${RESET}  Author      ${HACK_DIM}:${RESET}  ${BWHITE}${SCRIPT_AUTHOR}${RESET}"
+    echo -e "  ${HACK}║${RESET}  Repository  ${HACK_DIM}:${RESET}  ${BWHITE}${SCRIPT_REPO}${RESET}"
+    echo -e "  ${HACK}║${RESET}  Script      ${HACK_DIM}:${RESET}  ${BWHITE}${GITHUB_URL}${RESET}"
+    echo -e "  ${HACK}║${RESET}  Platform    ${HACK_DIM}:${RESET}  ${BWHITE}${SCRIPT_PLATFORM}${RESET}"
+    echo -e "  ${HACK}║${RESET}  Phases      ${HACK_DIM}:${RESET}  ${BWHITE}${TOTAL_STEPS} / ${TOTAL_STEPS} completed${RESET}"
+    echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
+    echo ""
+
+    echo -e "  ${HACK}╔══[NODE] DEPLOYMENT TARGET ════════════════════════╗${RESET}"
+    echo -e "  ${HACK}║${RESET}  Hostname    ${HACK_DIM}:${RESET}  ${BWHITE}${_host}${RESET}"
+    echo -e "  ${HACK}║${RESET}  OS          ${HACK_DIM}:${RESET}  ${BWHITE}${PRETTY_NAME}${RESET}"
+    echo -e "  ${HACK}║${RESET}  Kernel      ${HACK_DIM}:${RESET}  ${BWHITE}$(uname -r)${RESET}"
+    echo -e "  ${HACK}║${RESET}  Arch        ${HACK_DIM}:${RESET}  ${BWHITE}$(uname -m)${RESET}"
+    echo -e "  ${HACK}║${RESET}  Timezone    ${HACK_DIM}:${RESET}  ${BWHITE}$(get_timezone)${RESET}"
+    echo -e "  ${HACK}║${RESET}  Finished    ${HACK_DIM}:${RESET}  ${BWHITE}${_installed}${RESET}"
+    echo -e "  ${HACK}║${RESET}  Config      ${HACK_DIM}:${RESET}  ${BWHITE}/etc/rahmat/.env${RESET}"
+    echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
+    echo ""
+
+    echo -e "  ${HACK}╔══[SVC] SERVICE STATUS ════════════════════════════╗${RESET}"
+    echo -e "  ${HACK}║${RESET}  $(_svc_status_icon docker)  docker         ${HACK_DIM}:${RESET}  ${_docker_st}"
+    echo -e "  ${HACK}║${RESET}  $(_svc_status_icon firewalld)  firewalld     ${HACK_DIM}:${RESET}  $([[ "$_fw_st" == active ]] && echo -e "${HACK}${_fw_st}${RESET}" || echo -e "${HACK_ERR}${_fw_st}${RESET}")"
+    echo -e "  ${HACK}║${RESET}  $(_svc_status_icon fail2ban)  fail2ban      ${HACK_DIM}:${RESET}  $([[ "$_f2b_st" == active ]] && echo -e "${HACK}${_f2b_st}${RESET}" || echo -e "${HACK_ERR}${_f2b_st}${RESET}")"
+    echo -e "  ${HACK}║${RESET}  $(_svc_status_icon rahmat-ddos)  rahmat-ddos   ${HACK_DIM}:${RESET}  $([[ "$_ddos_st" == active ]] && echo -e "${HACK}${_ddos_st}${RESET}" || echo -e "${HACK_WARN}${_ddos_st}${RESET}")"
+    if [[ "$HARDEN_CHRONY" == "true" ]]; then
+        echo -e "  ${HACK}║${RESET}  $(_svc_status_icon chronyd)  chronyd       ${HACK_DIM}:${RESET}  $([[ "$_chr_st" == active ]] && echo -e "${HACK}${_chr_st}${RESET}" || echo -e "${HACK_WARN}${_chr_st}${RESET}")"
+    fi
+    if [[ "$HARDEN_AUDITD" == "true" ]]; then
+        echo -e "  ${HACK}║${RESET}  $(_svc_status_icon auditd)  auditd        ${HACK_DIM}:${RESET}  $([[ "$_aud_st" == active ]] && echo -e "${HACK}${_aud_st}${RESET}" || echo -e "${HACK_WARN}${_aud_st}${RESET}")"
+    fi
+    echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
+    echo ""
+
+    echo -e "  ${HACK}╔══[DNS] LISTENING PORTS ═══════════════════════════╗${RESET}"
+    echo -e "  ${HACK}║${RESET}  Ready       ${HACK_DIM}:${RESET}  ${BWHITE}${_ports_ok}/${_ports_total} ports free for DNS stack${RESET}"
+    echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD} 53${RESET}/udp  ${HACK_DIM}+${RESET}  ${BOLD}53${RESET}/tcp  ${HACK_DIM}→${RESET}  DNS Plain"
+    echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD}853${RESET}/tcp ${HACK_DIM}→${RESET}  DoT (DNS-over-TLS)"
+    echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD}443${RESET}/tcp ${HACK_DIM}→${RESET}  DoH (DNS-over-HTTPS)"
+    echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD} 22${RESET}/tcp ${HACK_DIM}→${RESET}  SSH (hardened)"
+    echo -e "  ${HACK}║${RESET}  ${HACK}[+]${RESET}  ${BOLD} 80${RESET}/tcp ${HACK_DIM}→${RESET}  HTTP / ACME"
+    echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
+    echo ""
+
+    echo -e "${BG_HACK}                                                      ${RESET}"
+    if [[ "${DOCKER_NEEDS_REBOOT:-false}" == "true" ]]; then
+        echo -e "${BG_HACK}   [!] REBOOT REQUIRED — then deploy your DNS stack    ${RESET}"
+    else
+        echo -e "${BG_HACK}   [+] NODE READY — deploy your DNS SaaS stack now     ${RESET}"
+    fi
+    echo -e "${BG_HACK}                                                      ${RESET}"
+    echo ""
+    echo -e "  ${HACK}[>]${RESET}  ${BOLD}Next steps${RESET}"
+    echo -e "      ${HACK_DIM}1.${RESET}  ${BOLD}reboot${RESET}  ${HACK_DIM}(recommended — apply all kernel tuning)${RESET}"
+    echo -e "      ${HACK_DIM}2.${RESET}  ${BOLD}nano /etc/rahmat/.env${RESET}  ${HACK_DIM}(review production settings)${RESET}"
+    echo -e "      ${HACK_DIM}3.${RESET}  Deploy DNS resolver on Docker ${HACK_DIM}(bind / unbound / CoreDNS)${RESET}"
+    echo -e "      ${HACK_DIM}4.${RESET}  ${BOLD}systemctl restart rahmat-ddos${RESET}  ${HACK_DIM}(after .env DDoS changes)${RESET}"
+    echo ""
+    if [[ "${DOCKER_NEEDS_REBOOT:-false}" == "true" ]]; then
+        echo -e "  ${HACK_ERR}[!]${RESET}  ${BOLD}REBOOT REQUIRED${RESET} — Docker needs updated kernel netfilter modules"
+        echo -e "  ${HACK}[>]${RESET}  ${BOLD}reboot${RESET}  ${HACK_DIM}# docker.service will start automatically${RESET}"
+    else
+        echo -e "  ${HACK_WARN}[!]${RESET}  ${BOLD}REBOOT RECOMMENDED${RESET} — kernel parameters apply fully after restart"
+        echo -e "  ${HACK}[>]${RESET}  ${BOLD}reboot${RESET}"
+    fi
+    echo ""
+    echo -e "  ${HACK_MUTED}────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${HACK}${BOLD}${SCRIPT_NAME}${RESET} ${HACK_DIM}·${RESET} ${SCRIPT_PRODUCT} ${HACK_DIM}·${RESET} v${SCRIPT_VERSION} ${HACK_DIM}·${RESET} ${SCRIPT_AUTHOR}"
+    echo -e "  ${HACK_DIM}${SCRIPT_REPO} · $(date '+%Y')${RESET}"
+    echo -e "  ${HACK_MUTED}────────────────────────────────────────────────────────────${RESET}"
     echo ""
 }
 
@@ -1450,11 +1582,6 @@ echo ""
 # ── Tools ───────────────────────────────────────────────────────
 echo -e "  ${HACK}╔══[BIN] TOOLCHAIN ═════════════════════════════════╗${RESET}"
 
-_row() {
-    local icon="$1" name="$2" val="$3"
-    printf "  ${HACK}║${RESET}  %b  %-12s${HACK_DIM}:${RESET}  ${BWHITE}%s${RESET}\n" "$icon" "$name" "$val"
-}
-
 if command -v git &>/dev/null; then
     _row "${HACK}[+]${RESET}" "git" "v$(git --version | awk '{print $3}')"
 else
@@ -1609,17 +1736,5 @@ echo -e "  ${HACK}║${RESET}  SELinux     ${HACK_DIM}:${RESET}  $(getenforce 2>
 echo -e "  ${HACK}║${RESET}  EPEL repo   ${HACK_DIM}:${RESET}  ${HACK}enabled${RESET}"
 echo -e "  ${HACK}║${RESET}  Docker src  ${HACK_DIM}:${RESET}  ${DOCKER_DNF_REPO#https://}"
 echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
-echo ""
 
-echo -e "  ${HACK}[+]${RESET} ${BOLD}NODE CLEARED :: DNS SAAS DEPLOYMENT READY${RESET}"
-echo ""
-if [[ "${DOCKER_NEEDS_REBOOT:-false}" == "true" ]]; then
-    echo -e "  ${HACK_ERR}[!]${RESET}  ${BOLD}REBOOT REQUIRED${RESET} — Docker needs the updated kernel's netfilter modules"
-    echo -e "  ${HACK}[>]${RESET}  ${BOLD}reboot${RESET}  ${HACK_DIM}# docker.service will start automatically${RESET}"
-else
-    echo -e "  ${HACK_WARN}[!]${RESET}  REBOOT RECOMMENDED — kernel params pending full apply"
-    echo -e "  ${HACK}[>]${RESET}  ${BOLD}reboot${RESET}"
-fi
-echo ""
-echo -e "  ${HACK_MUTED}RAHMAT // ${GITHUB_URL} // $(date '+%Y')${RESET}"
-echo ""
+print_final_summary
