@@ -25,7 +25,14 @@ nano .env && \
 chmod +x setup.sh && sudo bash setup.sh
 ```
 
-Set at minimum in `.env` before running: `SSH_PUBLIC_KEY`, and optionally `SSH_WHITELIST_IPS`.
+Set at minimum in `.env` before running:
+
+```bash
+SSH_PUBLIC_KEY="ssh-ed25519 AAAA... your-key"
+SSH_WHITELIST_IPS="YOUR_PUBLIC_IP/32"
+SSH_OPEN_PUBLIC="false"
+SSH_DISABLE_PASSWORD="yes"
+```
 
 If you skip `nano .env`, setup opens the editor at start (interactive terminal only). Phase 10 does **not** prompt for SSH keys or IPs.
 
@@ -144,7 +151,7 @@ sudo systemctl restart rahmat-ddos
 
 | Port | Protocol | Service |
 |------|----------|---------|
-| 22 | TCP | SSH (rate-limited; whitelist in phase 10) |
+| 22 | TCP | SSH (whitelist only by default; set `SSH_WHITELIST_IPS` or `SSH_OPEN_PUBLIC=true`) |
 | 53 | UDP | DNS (primary) |
 | 53 | TCP | DNS (fallback) |
 | 80 | TCP | HTTP / ACME |
@@ -190,6 +197,7 @@ sudo bash setup.sh
 ```bash
 SSH_PUBLIC_KEY="ssh-ed25519 AAAA... your-key"
 SSH_WHITELIST_IPS="203.0.113.10/32"
+SSH_OPEN_PUBLIC="false"
 SSH_DISABLE_PASSWORD="yes"
 INTERACTIVE_PROMPTS="false"
 ```
@@ -210,17 +218,49 @@ sudo bash setup.sh
 
 ---
 
+## Fresh VPS test (recommended)
+
+```bash
+# 1. On your laptop — copy your public key
+cat ~/.ssh/id_ed25519.pub
+
+# 2. On the new VPS (as root)
+curl -fsSL https://raw.githubusercontent.com/zamibd/setup/main/setup.sh -o setup.sh
+curl -fsSL https://raw.githubusercontent.com/zamibd/setup/main/.env.example -o .env
+nano .env   # set SSH_PUBLIC_KEY + SSH_WHITELIST_IPS to your IP
+chmod +x setup.sh && bash setup.sh
+
+# 3. After setup — verify SSH is NOT open to the world
+firewall-cmd --list-ports              # should NOT show 22/tcp (unless SSH_OPEN_PUBLIC=true)
+firewall-cmd --list-rich-rules         # should show rahmat-ssh-allow ipset rule
+firewall-cmd --ipset=list rahmat-ssh-allow
+
+# 4. Reboot, then SSH in with your key
+reboot
+ssh -i ~/.ssh/id_ed25519 root@YOUR_VPS_IP
+```
+
 ## Post-install checks
 
 ```bash
 # Services
-systemctl is-active docker rahmat-ddos fail2ban
+systemctl is-active docker firewalld rahmat-ddos fail2ban sshd
+
+# SSH firewall (whitelist mode)
+firewall-cmd --list-ports
+firewall-cmd --list-rich-rules
+firewall-cmd --ipset=list rahmat-ssh-allow
+
+# SSH hardening
+sshd -t
+grep -E '^(Port|PermitRootLogin|PasswordAuthentication|AllowUsers)' \
+  /etc/ssh/sshd_config.d/99-rahmat.conf
 
 # Ports free for DNS deploy
 ss -tulnp | grep -E ':53|:853'
 
 # DDoS chain
-sudo iptables -L RAHMAT-DDoS -n -v
+iptables -L RAHMAT-DDoS -n -v
 
 # Config
 cat /etc/rahmat/.env
@@ -244,7 +284,8 @@ This script prepares the **host**. Deploy your DNS SaaS stack on Docker after se
 
 | Issue | Action |
 |-------|--------|
-| Locked out of SSH | Use provider console (see below) |
+| Locked out of SSH | Provider console — see below |
+| Port 22 open to everyone | Set `SSH_OPEN_PUBLIC=false` and `SSH_WHITELIST_IPS` in `.env`, re-run `setup.sh` |
 | Docker won't start | `journalctl -xeu docker.service` |
 | DDoS blocks legit users | Raise `DOT_*` in `.env`, restart `rahmat-ddos` |
 | Port 53 in use | Stop `systemd-resolved` / `named`; re-run phase 14 |
@@ -275,10 +316,12 @@ chmod 600 /root/.ssh/authorized_keys
 
 ```bash
 fail2ban-client status sshd          # unban: fail2ban-client set sshd unbanip YOUR_IP
-firewall-cmd --list-all              # whitelist rules may block port 22 except listed IPs
+firewall-cmd --list-ports
+firewall-cmd --list-rich-rules
+firewall-cmd --ipset=list rahmat-ssh-allow
 ```
 
-**Before `curl | bash` in production**, create `/etc/rahmat/.env` with at least `SSH_PUBLIC_KEY` and your IP in `SSH_WHITELIST_IPS`.
+**Before production**, set `SSH_PUBLIC_KEY`, `SSH_WHITELIST_IPS`, and `SSH_OPEN_PUBLIC=false` in `.env`.
 
 ---
 
