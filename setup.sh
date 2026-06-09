@@ -36,7 +36,10 @@ load_dotenv() {
     [[ -f "$_file" ]] || return 1
     set -a
     # shellcheck disable=SC1090
-    source "$_file"
+    source "$_file" || {
+        set +a
+        fail "Cannot load ${_file} — check quotes/syntax, fix the file, and re-run setup.sh"
+    }
     set +a
     return 0
 }
@@ -178,8 +181,38 @@ step() {
 }
 
 # ── Interactive / validation helpers ─────────────────────────────
+has_tty() {
+    [[ -t 0 ]] || { [[ -r /dev/tty ]] && [[ -w /dev/tty ]]; }
+}
+
 is_interactive() {
-    [[ "${INTERACTIVE_PROMPTS}" == "true" ]] && [[ -t 0 ]]
+    [[ "${INTERACTIVE_PROMPTS}" == "true" ]] && has_tty
+}
+
+env_needs_editor() {
+    [[ -z "${SSH_PUBLIC_KEY:-}" ]]
+}
+
+open_env_editor() {
+    info "Opening editor — set SSH_PUBLIC_KEY and SSH_WHITELIST_IPS, then save and exit (Ctrl+O, Enter, Ctrl+X)"
+    if command -v nano &>/dev/null; then
+        if [[ -t 0 ]]; then
+            nano "$ENV_FILE" || return 1
+        else
+            nano "$ENV_FILE" </dev/tty >/dev/tty || return 1
+        fi
+    elif [[ -n "${EDITOR:-}" ]]; then
+        if [[ -t 0 ]]; then
+            "$EDITOR" "$ENV_FILE" || return 1
+        else
+            "$EDITOR" "$ENV_FILE" </dev/tty >/dev/tty || return 1
+        fi
+    elif [[ -t 0 ]]; then
+        vi "$ENV_FILE" || return 1
+    else
+        vi "$ENV_FILE" </dev/tty >/dev/tty || return 1
+    fi
+    return 0
 }
 
 ask_line() {
@@ -808,27 +841,28 @@ else
 fi
 detail "Set SSH_PUBLIC_KEY and SSH_WHITELIST_IPS in .env — port 22 is not open to the world by default"
 
-if is_interactive; then
-    echo ""
-    info "Opening editor — set SSH_PUBLIC_KEY, save, and exit nano to continue"
-    echo -e "  ${HACK}[>]${RESET}  ${BOLD}nano ${ENV_FILE}${RESET}"
-    if command -v nano &>/dev/null; then
-        nano "$ENV_FILE"
-    elif [[ -n "${EDITOR:-}" ]]; then
-        "$EDITOR" "$ENV_FILE"
+if env_needs_editor; then
+    if is_interactive; then
+        echo ""
+        open_env_editor || fail "Editor cancelled — save ${ENV_FILE} and re-run setup.sh"
+        echo ""
+        reload_config
+        ok "Config saved — continuing install automatically"
     else
-        vi "$ENV_FILE"
+        fail "SSH_PUBLIC_KEY is empty in ${ENV_FILE} — edit the file and re-run setup.sh"
     fi
-    echo ""
-    reload_config
-    ok "Config reloaded from ${ENV_FILE}"
+elif [[ -n "${SSH_PUBLIC_KEY:-}" ]]; then
+    ok "Config ready (SSH_PUBLIC_KEY set) — skipping editor"
 else
-    [[ -z "${SSH_PUBLIC_KEY:-}" ]] && \
-        warn "Non-interactive run with empty SSH_PUBLIC_KEY — set it in ${ENV_FILE}"
+    warn "Non-interactive run with empty SSH_PUBLIC_KEY"
 fi
 
 capture_ssh_client_ip
 validate_preflight_ssh
+
+echo ""
+ok "Starting installation — phase 1/${TOTAL_STEPS}"
+echo ""
 
 # Sync .env to system path
 install -d -m 750 /etc/rahmat
