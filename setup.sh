@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # ================================================================
 #  RAHMAT — DNS SaaS Server Setup Script
-#  Supports : Ubuntu 22.04+ (LTS & interim) | Debian (all) | AlmaLinux (all)
-#             Rocky · RHEL · CentOS Stream · Fedora (latest)
+#  Supports : AlmaLinux (8, 9, 10+)
 #  Author   : RAHMAT
 #  GitHub   : https://github.com/zamibd/setup/setup.sh
 #  Version  : 3.0.0
@@ -48,12 +47,20 @@ apply_config_defaults() {
     : "${LIMIT_NOFILE:=1048576}"
     : "${LIMIT_NPROC:=65535}"
     : "${SYSCTL_NETDEV_MAX_BACKLOG:=250000}"
+    : "${SYSCTL_NETDEV_BUDGET:=1200}"
+    : "${SYSCTL_NETDEV_BUDGET_USECS:=16000}"
     : "${SYSCTL_SOMAXCONN:=65535}"
     : "${SYSCTL_CONNTRACK_MAX:=2097152}"
     : "${SYSCTL_CONNTRACK_TCP_ESTABLISHED:=7200}"
     : "${SYSCTL_SWAPPINESS:=10}"
     : "${SYSCTL_FILE_MAX:=2097152}"
     : "${SYSCTL_UDP_RMEM_MIN:=16384}"
+    : "${TCP_BBR_ENABLED:=true}"
+    : "${PERF_THP_DISABLE:=true}"
+    : "${PERF_CPU_GOVERNOR:=true}"
+    : "${HARDEN_CHRONY:=true}"
+    : "${HARDEN_AUDITD:=true}"
+    : "${HARDEN_DISABLE_UNUSED_SERVICES:=true}"
     : "${DOCKER_LOG_MAX_SIZE:=10m}"
     : "${DOCKER_LOG_MAX_FILE:=3}"
     : "${DOCKER_STORAGE_DRIVER:=overlay2}"
@@ -100,7 +107,7 @@ load_dotenv "$ENV_FILE" || true
 load_dotenv "/etc/rahmat/.env" || true
 apply_config_defaults
 
-TOTAL_STEPS=14
+TOTAL_STEPS=15
 
 # ── Colors & Styles (hacker / matrix theme) ─────────────────────
 RESET='\033[0m'
@@ -422,7 +429,7 @@ EOFSCRIPT
         cat > /etc/systemd/system/rahmat-ddos.service << EOF
 [Unit]
 Description=RAHMAT DDoS mitigation iptables rules
-After=network-online.target ufw.service firewalld.service docker.service
+After=network-online.target firewalld.service docker.service
 Wants=network-online.target
 
 [Service]
@@ -497,7 +504,7 @@ banner() {
     echo -e "${RESET}"
     echo -e "  ${HACK}[root@rahmat:~#]${RESET} ${HACK_DIM}./setup.sh --deploy-dns${RESET}"
     echo -e "  ${HACK_MUTED}[$]${RESET} ${GREEN}${GITHUB_URL}${RESET}"
-    echo -e "  ${HACK_MUTED}[#]${RESET} ${HACK_DIM}ubuntu | debian | almalinux | rocky | rhel | fedora${RESET}"
+    echo -e "  ${HACK_MUTED}[#]${RESET} ${HACK_DIM}almalinux only${RESET}"
     echo ""
     echo -e "  ${HACK_MUTED}$(printf '%.0s=' {1..58})${RESET}"
     echo ""
@@ -531,101 +538,20 @@ source /etc/os-release
 
 OS_ID="${ID,,}"
 OS_VERSION="${VERSION_ID:-}"
-ID_LIKE="${ID_LIKE:-}"
-PKG_MANAGER=""
-OS_FAMILY=""
+PKG_MANAGER="dnf"
+OS_FAMILY="rhel"
 OS_DISPLAY=""
-DOCKER_APT_ID=""
-DOCKER_APT_SUITE=""
 DOCKER_DNF_REPO=""
-NEEDS_EPEL=true
 
-resolve_codename() {
-    local codename="${VERSION_CODENAME:-${UBUNTU_CODENAME:-${DEBIAN_CODENAME:-}}}"
-    if [[ -z "$codename" && -n "${VERSION:-}" ]]; then
-        codename=$(echo "$VERSION" | grep -oP '\(\K[a-z]+(?=\))' | head -1 || true)
-    fi
-    [[ -n "$codename" ]] || fail "Could not detect release codename for $PRETTY_NAME"
-    echo "$codename"
-}
-
-# Map bleeding-edge Debian/Ubuntu codenames to a Docker-supported suite when needed
-resolve_docker_apt_suite() {
-    local codename="$1"
-    local family="$2"
-    local -a known_debian=(forky trixie bookworm bullseye buster stretch)
-    local -a known_ubuntu=(
-        questing plucky oracular noble mantic lunar kinetic jammy impish hirsute focal
-    )
-    local known suite
-    if [[ "$family" == "debian" ]]; then
-        for suite in "${known_debian[@]}"; do
-            [[ "$codename" == "$suite" ]] && { echo "$codename"; return; }
-        done
-        case "$codename" in
-            sid|unstable|testing|rc-buggy) echo "trixie" ;;
-            *) echo "$codename" ;;
-        esac
-    else
-        for suite in "${known_ubuntu[@]}"; do
-            [[ "$codename" == "$suite" ]] && { echo "$codename"; return; }
-        done
-        # Future interim/LTS codenames not yet in Docker repos → latest known LTS
-        echo "noble"
-    fi
-}
-
-ubuntu_version_ok() {
-    local ver="$1"
-    local major minor
-    major=$(echo "$ver" | cut -d. -f1)
-    minor=$(echo "$ver" | cut -d. -f2)
-    minor=${minor:-0}
-    [[ $major -gt 22 ]] || [[ $major -eq 22 && $minor -ge 4 ]]
-}
-
-ubuntu_codename_supported() {
-    local codename="$1"
-    case "$codename" in
-        warty|hoary|breezy|dapper|edgy|feisty|gutsy|hardy|intrepid|jaunty|karmic|lucid|maverick|natty|oneiric|precise|quantal|raring|ringtail|saucy|trusty|utopic|vivid|wily|xenial|yakkety|zesty|artful|bionic|cosmic|disco|eoan|focal|groovy|hirsute|impish|kinetic|lunar|mantic)
-            return 1 ;;
-        *) return 0 ;;
-    esac
-}
-
-configure_apt_os() {
-    local label="$1"
-    local docker_id="$2"
-    CODENAME=$(resolve_codename)
-    DOCKER_APT_SUITE=$(resolve_docker_apt_suite "$CODENAME" "$docker_id")
-    DOCKER_APT_ID="$docker_id"
-    PKG_MANAGER="apt"
-    OS_FAMILY="debian"
-    OS_DISPLAY="$label"
-    ok "${BGREEN}${label}${RESET} (${CODENAME}) — supported"
-    detail "Codename    : $CODENAME"
-    if [[ "$DOCKER_APT_SUITE" != "$CODENAME" ]]; then
-        detail "Docker suite: $DOCKER_APT_SUITE (mapped from $CODENAME)"
-    else
-        detail "Docker suite: $DOCKER_APT_SUITE"
-    fi
-    detail "Arch        : $(dpkg --print-architecture)"
-}
-
-configure_dnf_os() {
-    local label="$1"
-    local epel="${2:-true}"
+configure_almalinux() {
     DOCKER_DNF_REPO=$(resolve_docker_dnf_repo)
-    NEEDS_EPEL="$epel"
-    PKG_MANAGER="dnf"
-    OS_FAMILY="rhel"
-    OS_DISPLAY="$label"
-    ok "${BGREEN}${label}${RESET} — supported"
-    detail "Version     : ${OS_VERSION:-rolling}"
+    OS_DISPLAY="AlmaLinux ${OS_VERSION:-}"
+    ok "${BGREEN}${OS_DISPLAY}${RESET} — supported"
+    detail "Version     : ${OS_VERSION:-unknown}"
     detail "Arch        : $(uname -m)"
     detail "Docker repo : ${DOCKER_DNF_REPO##*/}"
     is_rhel_el10_plus && detail "EL10+ notes  : iptables-nft + kernel-modules-extra"
-    [[ "$NEEDS_EPEL" == "true" ]] && detail "EPEL        : enabled"
+    detail "EPEL        : enabled"
 }
 
 rhel_major_version() {
@@ -639,76 +565,19 @@ is_rhel_el10_plus() {
 }
 
 resolve_docker_dnf_repo() {
-    case "$OS_ID" in
-        rhel|redhat)
-            echo "https://download.docker.com/linux/rhel/docker-ce.repo"
-            ;;
-        fedora)
-            echo "https://download.docker.com/linux/fedora/docker-ce.repo"
-            ;;
-        *)
-            if is_rhel_el10_plus; then
-                echo "https://download.docker.com/linux/rhel/docker-ce.repo"
-            else
-                echo "https://download.docker.com/linux/centos/docker-ce.repo"
-            fi
-            ;;
-    esac
+    if is_rhel_el10_plus; then
+        echo "https://download.docker.com/linux/rhel/docker-ce.repo"
+    else
+        echo "https://download.docker.com/linux/centos/docker-ce.repo"
+    fi
 }
 
 case "$OS_ID" in
-    ubuntu)
-        [[ -n "$OS_VERSION" ]] || fail "Could not detect Ubuntu version"
-        ubuntu_version_ok "$OS_VERSION" || \
-            fail "Ubuntu 22.04+ required. Found: $OS_VERSION (supported: 22.04, 24.04, 24.10, 25.04, 25.10, 26.04+)"
-        configure_apt_os "Ubuntu ${OS_VERSION}" "ubuntu"
-        ;;
-    debian)
-        configure_apt_os "Debian ${OS_VERSION:-}" "debian"
-        ;;
-    # Ubuntu-based derivatives (22.04+ base detected via codename)
-    linuxmint|pop|pop-os|elementary|zorin|peppermint|linuxlite|kubuntu|lubuntu|xubuntu|ubuntu-mate|ubuntustudio)
-        deriv_codename=$(resolve_codename)
-        ubuntu_codename_supported "$deriv_codename" || \
-            fail "$PRETTY_NAME requires Ubuntu 22.04+ base (codename: $deriv_codename)"
-        configure_apt_os "${PRETTY_NAME}" "ubuntu"
-        ;;
-    # Debian-based derivatives
-    kali|parrot|devuan|mx-linux|antiX)
-        configure_apt_os "${PRETTY_NAME}" "debian"
-        ;;
     almalinux)
-        configure_dnf_os "AlmaLinux ${OS_VERSION:-}"
-        ;;
-    rocky|rockylinux)
-        configure_dnf_os "Rocky Linux ${OS_VERSION:-}"
-        ;;
-    centos|centos_stream)
-        configure_dnf_os "CentOS ${OS_VERSION:-}"
-        ;;
-    rhel|redhat)
-        configure_dnf_os "RHEL ${OS_VERSION:-}"
-        ;;
-    ol|oraclelinux|oracle)
-        configure_dnf_os "Oracle Linux ${OS_VERSION:-}"
-        ;;
-    fedora)
-        configure_dnf_os "Fedora ${OS_VERSION:-}" "false"
+        configure_almalinux
         ;;
     *)
-        # Fallback: detect via ID_LIKE for unknown derivatives
-        if [[ "$ID_LIKE" == *ubuntu* ]]; then
-            like_codename=$(resolve_codename)
-            ubuntu_codename_supported "$like_codename" || \
-                fail "Unsupported derivative '$OS_ID'. Ubuntu 22.04+ base required (codename: $like_codename)."
-            configure_apt_os "${PRETTY_NAME}" "ubuntu"
-        elif [[ "$ID_LIKE" == *debian* ]]; then
-            configure_apt_os "${PRETTY_NAME}" "debian"
-        elif [[ "$ID_LIKE" == *rhel* ]] || [[ "$ID_LIKE" == *fedora* ]]; then
-            configure_dnf_os "${PRETTY_NAME}"
-        else
-            fail "Unsupported OS: '$OS_ID'. Supported: Ubuntu 22+, Debian, AlmaLinux, Rocky, RHEL, CentOS, Fedora"
-        fi
+        fail "Unsupported OS: '$OS_ID'. This installer supports AlmaLinux only."
         ;;
 esac
 
@@ -720,33 +589,16 @@ detail "OS family   : $OS_FAMILY"
 # ────────────────────────────────────────────────────────────────
 step 2 "$TOTAL_STEPS" "System Update & Upgrade"
 
-if [[ "$PKG_MANAGER" == "apt" ]]; then
-    export DEBIAN_FRONTEND=noninteractive
-    info "Running apt update..."
-    apt-get update -qq
-    ok "Package lists refreshed"
-    info "Running apt upgrade (this may take a while)..."
-    apt-get upgrade -y -qq \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold"
-    ok "System packages upgraded successfully"
+info "Running dnf update (this may take a while)..."
+dnf update -y -q
+ok "System packages upgraded successfully"
 
-elif [[ "$PKG_MANAGER" == "dnf" ]]; then
-    info "Running dnf update (this may take a while)..."
-    dnf update -y -q
-    ok "System packages upgraded successfully"
-
-    if [[ "$NEEDS_EPEL" == "true" ]]; then
-        if ! dnf repolist 2>/dev/null | grep -qi "epel"; then
-            info "Enabling EPEL repository..."
-            dnf install -y -q epel-release
-            ok "EPEL repository enabled"
-        else
-            skip "EPEL repository"
-        fi
-    else
-        skip "EPEL (not required on $OS_DISPLAY)"
-    fi
+if ! dnf repolist 2>/dev/null | grep -qi "epel"; then
+    info "Enabling EPEL repository..."
+    dnf install -y -q epel-release
+    ok "EPEL repository enabled"
+else
+    skip "EPEL repository"
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -754,56 +606,29 @@ fi
 # ────────────────────────────────────────────────────────────────
 step 3 "$TOTAL_STEPS" "Essential Packages"
 
-if [[ "$PKG_MANAGER" == "apt" ]]; then
-    PKGS=(
-        curl wget git ufw fail2ban iptables ipset
-        unattended-upgrades
-        ca-certificates gnupg lsb-release
-        htop net-tools make build-essential
-    )
-    TO_INSTALL=()
-    for pkg in "${PKGS[@]}"; do
-        if dpkg -s "$pkg" &>/dev/null; then
-            skip "${GREEN}${pkg}${RESET}"
-        else
-            info "queued: ${HACK_WARN}${pkg}${RESET}"
-            TO_INSTALL+=("$pkg")
-        fi
-    done
-    if [[ ${#TO_INSTALL[@]} -gt 0 ]]; then
-        echo ""
-        info "installing ${HACK_WARN}${#TO_INSTALL[@]}${RESET} package(s)..."
-        apt-get install -y -qq "${TO_INSTALL[@]}"
-        ok "All packages installed"
+PKGS=(
+    curl wget git nano fail2ban dnf-automatic iptables ipset
+    ca-certificates gnupg2 chrony audit kernel-tools
+    htop net-tools make gcc gcc-c++
+    firewalld dnf-plugins-core
+    policycoreutils-python-utils
+)
+TO_INSTALL=()
+for pkg in "${PKGS[@]}"; do
+    if rpm -q "$pkg" &>/dev/null; then
+        skip "${GREEN}${pkg}${RESET}"
     else
-        ok "All essential packages already present"
+        info "queued: ${HACK_WARN}${pkg}${RESET}"
+        TO_INSTALL+=("$pkg")
     fi
-
-elif [[ "$PKG_MANAGER" == "dnf" ]]; then
-    PKGS=(
-        curl wget git fail2ban dnf-automatic iptables ipset
-        ca-certificates gnupg2
-        htop net-tools make gcc gcc-c++
-        firewalld dnf-plugins-core
-        policycoreutils-python-utils
-    )
-    TO_INSTALL=()
-    for pkg in "${PKGS[@]}"; do
-        if rpm -q "$pkg" &>/dev/null; then
-            skip "${GREEN}${pkg}${RESET}"
-        else
-            info "queued: ${HACK_WARN}${pkg}${RESET}"
-            TO_INSTALL+=("$pkg")
-        fi
-    done
-    if [[ ${#TO_INSTALL[@]} -gt 0 ]]; then
-        echo ""
-        info "installing ${HACK_WARN}${#TO_INSTALL[@]}${RESET} package(s)..."
-        dnf install -y -q "${TO_INSTALL[@]}"
-        ok "All packages installed"
-    else
-        ok "All essential packages already present"
-    fi
+done
+if [[ ${#TO_INSTALL[@]} -gt 0 ]]; then
+    echo ""
+    info "installing ${HACK_WARN}${#TO_INSTALL[@]}${RESET} package(s)..."
+    dnf install -y -q "${TO_INSTALL[@]}"
+    ok "All packages installed"
+else
+    ok "All essential packages already present"
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -873,7 +698,7 @@ ensure_docker_running() {
         return 0
     fi
 
-    warn "Docker failed to start — running AlmaLinux/RHEL recovery..."
+    warn "Docker failed to start — running AlmaLinux recovery..."
     prepare_docker_dnf_host
     systemctl restart containerd 2>/dev/null || true
     sleep 1
@@ -903,7 +728,7 @@ ensure_docker_running() {
     return 1
 }
 
-# cgroupv2 + overlay2 — AlmaLinux and Ubuntu 22+ compatible
+# cgroupv2 + overlay2 — AlmaLinux compatible
 apply_docker_daemon_config() {
     info "Writing /etc/docker/daemon.json..."
     mkdir -p /etc/docker
@@ -919,47 +744,6 @@ apply_docker_daemon_config() {
 }
 EOF
     ok "daemon.json written (${DOCKER_CGROUP_DRIVER}, log ${DOCKER_LOG_MAX_SIZE}×${DOCKER_LOG_MAX_FILE})"
-}
-
-install_docker_apt() {
-    info "Adding Docker official GPG key..."
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL "https://download.docker.com/linux/${DOCKER_APT_ID}/gpg" \
-        -o /etc/apt/keyrings/docker.asc
-    chmod a+r /etc/apt/keyrings/docker.asc
-    ok "GPG key saved"
-
-    info "Adding Docker apt repository (${DOCKER_APT_ID}/${DOCKER_APT_SUITE})..."
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
-https://download.docker.com/linux/${DOCKER_APT_ID} ${DOCKER_APT_SUITE} stable" \
-        | tee /etc/apt/sources.list.d/docker.list > /dev/null
-    apt-get update -qq
-    ok "Repository configured"
-
-    info "Installing Docker CE + plugins..."
-    if ! apt-get install -y -qq \
-        docker-ce docker-ce-cli containerd.io \
-        docker-buildx-plugin docker-compose-plugin; then
-        warn "Install failed for suite '${DOCKER_APT_SUITE}' — retrying with fallback..."
-        local fallback
-        fallback=$([[ "$DOCKER_APT_ID" == "ubuntu" ]] && echo "noble" || echo "bookworm")
-        [[ "$fallback" == "$DOCKER_APT_SUITE" ]] && fail "Docker packages unavailable for ${PRETTY_NAME}"
-        sed -i "s/ ${DOCKER_APT_SUITE} / ${fallback} /" /etc/apt/sources.list.d/docker.list
-        DOCKER_APT_SUITE="$fallback"
-        apt-get update -qq
-        apt-get install -y -qq \
-            docker-ce docker-ce-cli containerd.io \
-            docker-buildx-plugin docker-compose-plugin
-        ok "Docker packages installed (fallback suite: ${fallback})"
-    else
-        ok "Docker packages installed"
-    fi
-
-    apply_docker_daemon_config
-
-    systemctl daemon-reload
-    systemctl enable --now docker
-    ok "Docker service enabled & started"
 }
 
 install_docker_dnf() {
@@ -979,12 +763,6 @@ install_docker_dnf() {
     ensure_docker_running || true
 }
 
-upgrade_docker_apt() {
-    apt-get install -y -qq --only-upgrade \
-        docker-ce docker-ce-cli containerd.io \
-        docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
-}
-
 upgrade_docker_dnf() {
     dnf upgrade -y -q \
         docker-ce docker-ce-cli containerd.io \
@@ -994,10 +772,7 @@ upgrade_docker_dnf() {
 if command -v docker &>/dev/null; then
     OLD_VER=$(docker --version | extract_semver)
     info "docker found (${HACK_WARN}v${OLD_VER}${RESET}) — checking for upgrades..."
-    case "$PKG_MANAGER" in
-        apt) upgrade_docker_apt ;;
-        *)   upgrade_docker_dnf ;;
-    esac
+    upgrade_docker_dnf
     NEW_VER=$(docker --version | extract_semver)
     if [[ "$OLD_VER" != "$NEW_VER" ]]; then
         ok "docker upgraded: ${HACK_WARN}v${OLD_VER}${RESET} → ${HACK}v${NEW_VER}${RESET}"
@@ -1016,18 +791,13 @@ if command -v docker &>/dev/null; then
     fi
 
     if ! docker info &>/dev/null 2>&1; then
-        if [[ "$PKG_MANAGER" == "dnf" ]]; then
-            warn "Docker daemon not responding — retrying with EL host recovery..."
-            prepare_docker_dnf_host
-            svc_daemon_reload
-            ensure_docker_running || true
-        fi
+        warn "Docker daemon not responding — retrying with AlmaLinux host recovery..."
+        prepare_docker_dnf_host
+        svc_daemon_reload
+        ensure_docker_running || true
     fi
 else
-    case "$PKG_MANAGER" in
-        apt) install_docker_apt ;;
-        *)   install_docker_dnf ;;
-    esac
+    install_docker_dnf
 fi
 
 if docker compose version &>/dev/null 2>&1; then
@@ -1126,8 +896,8 @@ net.core.rmem_default        = 1048576
 net.core.wmem_default        = 1048576
 net.core.optmem_max          = 65536
 net.core.netdev_max_backlog  = ${SYSCTL_NETDEV_MAX_BACKLOG}
-net.core.netdev_budget       = 600
-net.core.netdev_budget_usecs = 8000
+net.core.netdev_budget       = ${SYSCTL_NETDEV_BUDGET}
+net.core.netdev_budget_usecs = ${SYSCTL_NETDEV_BUDGET_USECS}
 net.core.somaxconn           = ${SYSCTL_SOMAXCONN}
 
 net.ipv4.udp_mem             = 65536 131072 262144
@@ -1162,12 +932,25 @@ fs.file-max                  = ${SYSCTL_FILE_MAX}
 fs.nr_open                   = ${SYSCTL_FILE_MAX}
 EOF
 
+if [[ "$TCP_BBR_ENABLED" == "true" ]]; then
+    cat >> "$SYSCTL_FILE" << 'EOF'
+
+# TCP BBR congestion control (DoT/DoH throughput)
+net.core.default_qdisc             = fq
+net.ipv4.tcp_congestion_control    = bbr
+EOF
+fi
+
 modprobe nf_conntrack 2>/dev/null || true
-cat > /etc/modules-load.d/rahmat-dns.conf << 'EOF'
+if [[ "$TCP_BBR_ENABLED" == "true" ]]; then
+    modprobe tcp_bbr 2>/dev/null || true
+fi
+cat > /etc/modules-load.d/rahmat-dns.conf << EOF
 nf_conntrack
 xt_hashlimit
 xt_connlimit
 xt_recent
+$([[ "$TCP_BBR_ENABLED" == "true" ]] && echo tcp_bbr)
 EOF
 
 info "Applying DNS/DoT sysctl parameters..."
@@ -1177,7 +960,16 @@ while IFS= read -r _line; do
     sysctl -w "$_line" > /dev/null 2>&1 || true
 done < "$SYSCTL_FILE"
 sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1 || true
-ok "Kernel tuned for DNS 53 (udp/tcp) + DoT 853"
+if [[ "$TCP_BBR_ENABLED" == "true" ]]; then
+    if sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+        ok "Kernel tuned for DNS 53 (udp/tcp) + DoT 853 + TCP BBR"
+    else
+        ok "Kernel tuned for DNS 53 (udp/tcp) + DoT 853"
+        warn "TCP BBR requested but not active — kernel may lack tcp_bbr (reboot after kernel update)"
+    fi
+else
+    ok "Kernel tuned for DNS 53 (udp/tcp) + DoT 853"
+fi
 
 mkdir -p /etc/systemd/system.conf.d
 if has_systemd; then
@@ -1199,21 +991,15 @@ detail "TCP syn_backlog: $(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null ||
 detail "netdev_backlog : $(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo n/a)"
 detail "conntrack_max  : $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo n/a)"
 detail "fs.file-max    : $(sysctl -n fs.file-max 2>/dev/null || echo n/a)"
+if [[ "$TCP_BBR_ENABLED" == "true" ]]; then
+    detail "TCP congestion: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo n/a) (qdisc $(sysctl -n net.core.default_qdisc 2>/dev/null || echo n/a))"
+fi
 detail "Port targets   : 53/udp 53/tcp 853/tcp"
 
 # ────────────────────────────────────────────────────────────────
 # STEP 8 — Firewall
 # ────────────────────────────────────────────────────────────────
 step 8 "$TOTAL_STEPS" "Firewall Rules"
-
-open_port_ufw() {
-    local port="$1" label="$2"
-    ufw allow "$port" > /dev/null
-    local proto num
-    proto=$(echo "$port" | cut -d/ -f2 | tr '[:lower:]' '[:upper:]')
-    num=$(echo "$port" | cut -d/ -f1)
-    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}${num}${RESET}/${HACK}${proto}${RESET}   ${HACK_DIM}::${RESET} ${WHITE}${label}${RESET}"
-}
 
 open_port_firewalld() {
     local port="$1" label="$2"
@@ -1224,44 +1010,21 @@ open_port_firewalld() {
     echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}${num}${RESET}/${HACK}${proto}${RESET}   ${HACK_DIM}::${RESET} ${WHITE}${label}${RESET}"
 }
 
-if [[ "$PKG_MANAGER" == "apt" ]]; then
-    info "Configuring UFW..."
-    command -v ufw &>/dev/null || apt-get install -y -qq ufw
-    ufw --force reset > /dev/null 2>&1
-    ufw default deny incoming  > /dev/null
-    ufw default allow outgoing > /dev/null
-    ok "Default policy → ${BRED}DENY${RESET} incoming / ${BGREEN}ALLOW${RESET} outgoing"
-    echo ""
-    open_port_ufw "53/udp"  "DNS — Plain UDP (primary)"
-    open_port_ufw "53/tcp"  "DNS — Plain TCP (fallback)"
-    open_port_ufw "853/tcp" "DoT — DNS-over-TLS"
-    ufw limit 22/tcp > /dev/null 2>&1 || ufw allow 22/tcp > /dev/null
-    echo -e "  ${HACK}[+]${RESET}  ${BOLD}${GREEN}22${RESET}/${HACK}TCP${RESET}   ${HACK_DIM}::${RESET} ${WHITE}SSH — rate limited (DDoS)${RESET}"
-    open_port_ufw "80/tcp"  "HTTP — ACME / Certificate Renewal"
-    open_port_ufw "443/tcp" "HTTPS — DoH (DNS-over-HTTPS)"
-    ufw deny in proto icmp > /dev/null 2>&1 || true
-    ok "ICMP ping blocked (UFW + sysctl)"
-    echo ""
-    ufw --force enable > /dev/null
-    ok "UFW firewall ${BGREEN}enabled${RESET}"
-
-elif [[ "$PKG_MANAGER" == "dnf" ]]; then
-    info "Configuring firewalld..."
-    systemctl enable --now firewalld > /dev/null 2>&1
-    ok "Default policy → ${BRED}DENY${RESET} incoming / ${BGREEN}ALLOW${RESET} outgoing"
-    echo ""
-    open_port_firewalld "53/udp"  "DNS — Plain UDP (primary)"
-    open_port_firewalld "53/tcp"  "DNS — Plain TCP (fallback)"
-    open_port_firewalld "853/tcp" "DoT — DNS-over-TLS"
-    open_port_firewalld "22/tcp"  "SSH — Admin Access (restricted in phase 09)"
-    open_port_firewalld "80/tcp"  "HTTP — ACME / Certificate Renewal"
-    open_port_firewalld "443/tcp" "HTTPS — DoH (DNS-over-HTTPS)"
-    firewall-cmd --permanent --add-icmp-block=echo-request > /dev/null 2>&1 || true
-    ok "ICMP ping blocked (firewalld + sysctl)"
-    echo ""
-    firewall-cmd --reload > /dev/null 2>&1
-    ok "firewalld ${BGREEN}reloaded & active${RESET}"
-fi
+info "Configuring firewalld..."
+systemctl enable --now firewalld > /dev/null 2>&1
+ok "Default policy → ${BRED}DENY${RESET} incoming / ${BGREEN}ALLOW${RESET} outgoing"
+echo ""
+open_port_firewalld "53/udp"  "DNS — Plain UDP (primary)"
+open_port_firewalld "53/tcp"  "DNS — Plain TCP (fallback)"
+open_port_firewalld "853/tcp" "DoT — DNS-over-TLS"
+open_port_firewalld "22/tcp"  "SSH — Admin Access (restricted in phase 09)"
+open_port_firewalld "80/tcp"  "HTTP — ACME / Certificate Renewal"
+open_port_firewalld "443/tcp" "HTTPS — DoH (DNS-over-HTTPS)"
+firewall-cmd --permanent --add-icmp-block=echo-request > /dev/null 2>&1 || true
+ok "ICMP ping blocked (firewalld + sysctl)"
+echo ""
+firewall-cmd --reload > /dev/null 2>&1
+ok "firewalld ${BGREEN}reloaded & active${RESET}"
 
 # ────────────────────────────────────────────────────────────────
 # STEP 9 — DDoS Protection
@@ -1281,10 +1044,8 @@ apply_ddos_kernel
 info "Installing per-IP rate limits (53 udp/tcp · 853 · 443)..."
 install_ddos_script
 
-if [[ "$PKG_MANAGER" == "dnf" ]]; then
-    apply_ddos_firewalld
-    ok "firewalld DDoS passthrough rules applied"
-fi
+apply_ddos_firewalld
+ok "firewalld DDoS passthrough rules applied"
 
 ok "DDoS protection active"
 detail "Config        : ${DDOS_CONF}"
@@ -1366,20 +1127,12 @@ if [[ ${#SSH_WHITELIST[@]} -gt 0 ]]; then
         done
         $_wl_ok || warn "Current session IP ${CURRENT_SSH_IP} NOT in whitelist — verify before disconnect!"
     fi
-    if [[ "$PKG_MANAGER" == "apt" ]]; then
-        ufw delete allow 22/tcp > /dev/null 2>&1 || true
-        for ip in "${SSH_WHITELIST[@]}"; do
-            ufw allow from "$ip" to any port 22 proto tcp > /dev/null
-            detail "UFW allow SSH from $ip"
-        done
-    else
-        firewall-cmd --permanent --remove-port=22/tcp > /dev/null 2>&1 || true
-        for ip in "${SSH_WHITELIST[@]}"; do
-            firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${ip}' port port='22' protocol='tcp' accept" > /dev/null 2>&1
-            detail "firewalld allow SSH from $ip"
-        done
-        firewall-cmd --reload > /dev/null 2>&1
-    fi
+    firewall-cmd --permanent --remove-port=22/tcp > /dev/null 2>&1 || true
+    for ip in "${SSH_WHITELIST[@]}"; do
+        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${ip}' port port='22' protocol='tcp' accept" > /dev/null 2>&1
+        detail "firewalld allow SSH from $ip"
+    done
+    firewall-cmd --reload > /dev/null 2>&1
     ok "SSH restricted to ${#SSH_WHITELIST[@]} IP/CIDR rule(s)"
 else
     ok "SSH open on port 22 (no whitelist configured)"
@@ -1432,13 +1185,8 @@ step 11 "$TOTAL_STEPS" "Fail2Ban Jail Configuration"
 F2B_JAIL="/etc/fail2ban/jail.d/rahmat.local"
 mkdir -p /etc/fail2ban/jail.d
 
-if [[ "$PKG_MANAGER" == "apt" ]]; then
-    F2B_BANACTION="ufw"
-    F2B_BACKEND="systemd"
-elif [[ "$PKG_MANAGER" == "dnf" ]]; then
-    F2B_BANACTION="firewallcmd-rich-rules"
-    F2B_BACKEND="systemd"
-fi
+F2B_BANACTION="firewallcmd-rich-rules"
+F2B_BACKEND="systemd"
 
 cat > "$F2B_JAIL" << EOF
 # RAHMAT — Fail2Ban jails (from .env)
@@ -1474,7 +1222,7 @@ detail "sshd bantime  : 24h (86400s)"
 detail "recidive      : 7d ban on repeat offenders"
 
 # ────────────────────────────────────────────────────────────────
-# STEP 12 — SELinux Tuning (RHEL family)
+# STEP 12 — SELinux Tuning (AlmaLinux)
 # ────────────────────────────────────────────────────────────────
 step 12 "$TOTAL_STEPS" "SELinux Tuning"
 
@@ -1514,71 +1262,35 @@ fi
 # ────────────────────────────────────────────────────────────────
 step 13 "$TOTAL_STEPS" "Automatic Security Updates"
 
-if [[ "$PKG_MANAGER" == "apt" ]]; then
-    cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-EOF
-    if [[ -f /etc/apt/apt.conf.d/50unattended-upgrades ]]; then
-        sed -i 's|^//\s*"${distro_id}:${distro_codename}-security";|"${distro_id}:${distro_codename}-security";|' \
-            /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null || true
-    fi
-    systemctl enable unattended-upgrades > /dev/null 2>&1 || true
-    systemctl restart unattended-upgrades > /dev/null 2>&1 || true
-    ok "unattended-upgrades enabled (Debian/Ubuntu)"
-    detail "Config : /etc/apt/apt.conf.d/20auto-upgrades"
-
-elif [[ "$PKG_MANAGER" == "dnf" ]]; then
-    command -v dnf-automatic &>/dev/null || dnf install -y -q dnf-automatic
-    if [[ -f /etc/dnf/automatic.conf ]]; then
-        sed -i 's/^apply_updates\s*=.*/apply_updates = yes/' /etc/dnf/automatic.conf
-        sed -i 's/^upgrade_type\s*=.*/upgrade_type = security/' /etc/dnf/automatic.conf
-        grep -q '^apply_updates' /etc/dnf/automatic.conf || echo 'apply_updates = yes' >> /etc/dnf/automatic.conf
-        grep -q '^upgrade_type' /etc/dnf/automatic.conf || echo 'upgrade_type = security' >> /etc/dnf/automatic.conf
-    fi
-    systemctl enable --now dnf-automatic.timer > /dev/null 2>&1
-    ok "dnf-automatic timer enabled (AlmaLinux/RHEL)"
-    detail "Config : /etc/dnf/automatic.conf"
-    detail "Type   : security updates only"
+command -v dnf-automatic &>/dev/null || dnf install -y -q dnf-automatic
+if [[ -f /etc/dnf/automatic.conf ]]; then
+    sed -i 's/^apply_updates\s*=.*/apply_updates = yes/' /etc/dnf/automatic.conf
+    sed -i 's/^upgrade_type\s*=.*/upgrade_type = security/' /etc/dnf/automatic.conf
+    grep -q '^apply_updates' /etc/dnf/automatic.conf || echo 'apply_updates = yes' >> /etc/dnf/automatic.conf
+    grep -q '^upgrade_type' /etc/dnf/automatic.conf || echo 'upgrade_type = security' >> /etc/dnf/automatic.conf
 fi
+systemctl enable --now dnf-automatic.timer > /dev/null 2>&1
+ok "dnf-automatic timer enabled (AlmaLinux)"
+detail "Config : /etc/dnf/automatic.conf"
+detail "Type   : security updates only"
 
 # ────────────────────────────────────────────────────────────────
 # STEP 14 — Free Port 53
 # ────────────────────────────────────────────────────────────────
 step 14 "$TOTAL_STEPS" "Free Port 53"
 
-if [[ "$PKG_MANAGER" == "apt" ]]; then
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        info "Stopping systemd-resolved..."
-        systemctl disable --now systemd-resolved
-        ok "systemd-resolved ${BRED}stopped & disabled${RESET}"
+for svc in named dnsmasq; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        info "Stopping $svc..."
+        systemctl disable --now "$svc"
+        ok "$svc ${BRED}stopped & disabled${RESET}"
     else
-        ok "systemd-resolved was already inactive"
+        ok "$svc — already inactive"
     fi
-
-    for svc in bind9 named; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            info "Stopping $svc..."
-            systemctl disable --now "$svc"
-            ok "$svc ${BRED}stopped & disabled${RESET}"
-        fi
-    done
-
-elif [[ "$PKG_MANAGER" == "dnf" ]]; then
-    for svc in named dnsmasq; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            info "Stopping $svc..."
-            systemctl disable --now "$svc"
-            ok "$svc ${BRED}stopped & disabled${RESET}"
-        else
-            ok "$svc — already inactive"
-        fi
-    done
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        systemctl disable --now systemd-resolved
-        ok "systemd-resolved stopped"
-    fi
+done
+if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    systemctl disable --now systemd-resolved
+    ok "systemd-resolved stopped"
 fi
 
 if [[ -L /etc/resolv.conf ]]; then
@@ -1604,6 +1316,116 @@ for _spec in "53 udp" "53 tcp" "853 tcp"; do
         ok "Port ${_p}/${_pr} free — ready for DNS/DoT"
     fi
 done
+
+# ────────────────────────────────────────────────────────────────
+# STEP 15 — Performance & Advanced Hardening
+# ────────────────────────────────────────────────────────────────
+step 15 "$TOTAL_STEPS" "Performance & Advanced Hardening"
+
+if [[ "$PERF_THP_DISABLE" == "true" ]]; then
+    info "Disabling transparent huge pages (lower DNS latency jitter)..."
+    for _thp in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag; do
+        [[ -f "$_thp" ]] && echo never > "$_thp" 2>/dev/null || true
+    done
+    cat > /etc/tmpfiles.d/rahmat-thp.conf << 'EOF'
+# RAHMAT — disable THP at boot
+w /sys/kernel/mm/transparent_hugepage/enabled - - - - never
+w /sys/kernel/mm/transparent_hugepage/defrag - - - - never
+EOF
+    systemd-tmpfiles --create /etc/tmpfiles.d/rahmat-thp.conf 2>/dev/null || true
+    ok "Transparent huge pages disabled"
+    detail "Persist : /etc/tmpfiles.d/rahmat-thp.conf"
+else
+    skip "THP disable (PERF_THP_DISABLE=false)"
+fi
+
+if [[ "$PERF_CPU_GOVERNOR" == "true" ]]; then
+    if command -v cpupower &>/dev/null; then
+        info "Setting CPU governor to performance..."
+        if cpupower frequency-set -g performance &>/dev/null; then
+            ok "CPU governor → performance"
+        else
+            warn "cpupower could not set performance governor (VM or unsupported CPU)"
+        fi
+        if has_systemd && [[ ! -f /etc/systemd/system/rahmat-cpugovernor.service ]]; then
+            cat > /etc/systemd/system/rahmat-cpugovernor.service << 'EOF'
+[Unit]
+Description=RAHMAT CPU performance governor
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/cpupower frequency-set -g performance
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            svc_daemon_reload
+            systemctl enable rahmat-cpugovernor.service > /dev/null 2>&1
+            detail "Boot unit : rahmat-cpugovernor.service"
+        fi
+    else
+        warn "cpupower not found — install kernel-tools"
+    fi
+else
+    skip "CPU performance governor (PERF_CPU_GOVERNOR=false)"
+fi
+
+if [[ "$HARDEN_CHRONY" == "true" ]]; then
+    info "Configuring chrony (accurate time for TLS/logs)..."
+    systemctl enable --now chronyd > /dev/null 2>&1 || systemctl enable --now chrony > /dev/null 2>&1 || true
+    if chronyc tracking &>/dev/null || timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then
+        ok "chrony enabled — NTP synchronized"
+    else
+        ok "chrony enabled (sync may take a minute)"
+    fi
+    detail "Service : chronyd"
+else
+    skip "chrony (HARDEN_CHRONY=false)"
+fi
+
+if [[ "$HARDEN_AUDITD" == "true" ]]; then
+    info "Configuring auditd rules (SSH, rahmat, firewall, Docker)..."
+    mkdir -p /etc/audit/rules.d
+    cat > /etc/audit/rules.d/rahmat.rules << 'EOF'
+# RAHMAT — audit critical config changes
+-w /etc/ssh/sshd_config -p wa -k rahmat_sshd
+-w /etc/ssh/sshd_config.d/ -p wa -k rahmat_sshd
+-w /etc/rahmat/ -p wa -k rahmat_config
+-w /etc/firewalld/ -p wa -k rahmat_firewall
+-w /etc/docker/daemon.json -p wa -k rahmat_docker
+-w /etc/sysctl.d/99-rahmat-dns.conf -p wa -k rahmat_sysctl
+-w /etc/sysctl.d/99-rahmat-ddos.conf -p wa -k rahmat_sysctl
+EOF
+    if command -v augenrules &>/dev/null; then
+        augenrules --load > /dev/null 2>&1 || true
+    fi
+    systemctl enable --now auditd > /dev/null 2>&1 || true
+    ok "auditd rules loaded → /etc/audit/rules.d/rahmat.rules"
+    detail "Query   : ausearch -k rahmat_sshd"
+else
+    skip "auditd (HARDEN_AUDITD=false)"
+fi
+
+if [[ "$HARDEN_DISABLE_UNUSED_SERVICES" == "true" ]]; then
+    info "Disabling unused services..."
+    _disabled=0
+    for _svc in avahi-daemon cups bluetooth; do
+        if systemctl list-unit-files "${_svc}.service" &>/dev/null 2>&1; then
+            if systemctl is-enabled --quiet "${_svc}.service" 2>/dev/null; then
+                systemctl disable --now "${_svc}.service" > /dev/null 2>&1 || true
+                detail "disabled: ${_svc}"
+                _disabled=$((_disabled + 1))
+            else
+                skip "${_svc} (already disabled)"
+            fi
+        fi
+    done
+    [[ $_disabled -gt 0 ]] && ok "${_disabled} unused service(s) disabled" || ok "No unused services needed disabling"
+else
+    skip "unused service cleanup (HARDEN_DISABLE_UNUSED_SERVICES=false)"
+fi
 
 # ════════════════════════════════════════════════════════════════
 # MISSION REPORT
@@ -1715,13 +1537,8 @@ echo -e "  ${HACK}╚═══════════════════�
 echo ""
 
 # ── Firewall ─────────────────────────────────────────────────────
-if [[ "$PKG_MANAGER" == "apt" ]]; then
-    FW_NAME="UFW"
-    FW_STATE=$(ufw status | head -1 | awk '{print $NF}')
-else
-    FW_NAME="firewalld"
-    FW_STATE=$(systemctl is-active firewalld 2>/dev/null || echo "unknown")
-fi
+FW_NAME="firewalld"
+FW_STATE=$(systemctl is-active firewalld 2>/dev/null || echo "unknown")
 
 echo -e "  ${HACK}╔══[NET] FIREWALL :: ${FW_NAME} ═══════════════════════╗${RESET}"
 echo -e "  ${HACK}║${RESET}  Status     ${HACK_DIM}:${RESET}  ${HACK}${FW_STATE}${RESET}"
@@ -1741,6 +1558,9 @@ echo -e "  ${HACK}║${RESET}  UDP rmem_min  ${HACK_DIM}:${RESET}  $(sysctl -n n
 echo -e "  ${HACK}║${RESET}  TCP syn_queue ${HACK_DIM}:${RESET}  $(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo n/a)"
 echo -e "  ${HACK}║${RESET}  netdev_queue  ${HACK_DIM}:${RESET}  $(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo n/a)"
 echo -e "  ${HACK}║${RESET}  conntrack     ${HACK_DIM}:${RESET}  $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo n/a)"
+if [[ "$TCP_BBR_ENABLED" == "true" ]]; then
+    echo -e "  ${HACK}║${RESET}  TCP BBR       ${HACK_DIM}:${RESET}  $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo n/a) / qdisc $(sysctl -n net.core.default_qdisc 2>/dev/null || echo n/a)"
+fi
 
 for _spec in "53:udp:DNS UDP" "53:tcp:DNS TCP" "853:tcp:DoT TLS"; do
     IFS=: read -r _p _pr _lbl <<< "$_spec"
@@ -1753,19 +1573,43 @@ done
 echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
 echo ""
 
-# ── RHEL-family extra note ───────────────────────────────────────
-if [[ "$OS_FAMILY" == "rhel" ]]; then
-    echo -e "  ${HACK}╔══[RHL] RHEL FAMILY NOTES ════════════════════════╗${RESET}"
-    echo -e "  ${HACK}║${RESET}  Distro      ${HACK_DIM}:${RESET}  ${OS_DISPLAY}"
-    echo -e "  ${HACK}║${RESET}  Firewall    ${HACK_DIM}:${RESET}  firewalld (not UFW)"
-    echo -e "  ${HACK}║${RESET}  SELinux     ${HACK_DIM}:${RESET}  $(getenforce 2>/dev/null || echo 'N/A')"
-    if [[ "$NEEDS_EPEL" == "true" ]]; then
-        echo -e "  ${HACK}║${RESET}  EPEL repo   ${HACK_DIM}:${RESET}  ${HACK}enabled${RESET}"
-    fi
-    echo -e "  ${HACK}║${RESET}  Docker src  ${HACK_DIM}:${RESET}  ${DOCKER_DNF_REPO#https://}"
-    echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
-    echo ""
+# ── Phase 15 extras ───────────────────────────────────────────────
+echo -e "  ${HACK}╔══[OPT] PERF & ADVANCED HARDENING ═════════════════╗${RESET}"
+if [[ "$PERF_THP_DISABLE" == "true" ]]; then
+    _thp_state=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | awk '{print $1}' | tr -d '[]' || echo n/a)
+    echo -e "  ${HACK}║${RESET}  THP           ${HACK_DIM}:${RESET}  ${_thp_state}"
+else
+    echo -e "  ${HACK}║${RESET}  THP           ${HACK_DIM}:${RESET}  ${HACK_DIM}unchanged${RESET}"
 fi
+if [[ "$PERF_CPU_GOVERNOR" == "true" ]] && command -v cpupower &>/dev/null; then
+    echo -e "  ${HACK}║${RESET}  CPU governor  ${HACK_DIM}:${RESET}  $(cpupower frequency-info -p 2>/dev/null | awk -F: '{print $2}' | xargs || echo n/a)"
+else
+    echo -e "  ${HACK}║${RESET}  CPU governor  ${HACK_DIM}:${RESET}  ${HACK_DIM}default${RESET}"
+fi
+echo -e "  ${HACK}║${RESET}  netdev_budget ${HACK_DIM}:${RESET}  $(sysctl -n net.core.netdev_budget 2>/dev/null || echo n/a) / $(sysctl -n net.core.netdev_budget_usecs 2>/dev/null || echo n/a) usecs"
+if [[ "$HARDEN_CHRONY" == "true" ]]; then
+    echo -e "  ${HACK}║${RESET}  chrony        ${HACK_DIM}:${RESET}  $(systemctl is-active chronyd 2>/dev/null || systemctl is-active chrony 2>/dev/null || echo inactive)"
+else
+    echo -e "  ${HACK}║${RESET}  chrony        ${HACK_DIM}:${RESET}  ${HACK_DIM}skipped${RESET}"
+fi
+if [[ "$HARDEN_AUDITD" == "true" ]]; then
+    echo -e "  ${HACK}║${RESET}  auditd        ${HACK_DIM}:${RESET}  $(systemctl is-active auditd 2>/dev/null || echo inactive)"
+    echo -e "  ${HACK}║${RESET}  audit rules   ${HACK_DIM}:${RESET}  /etc/audit/rules.d/rahmat.rules"
+else
+    echo -e "  ${HACK}║${RESET}  auditd        ${HACK_DIM}:${RESET}  ${HACK_DIM}skipped${RESET}"
+fi
+echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
+echo ""
+
+# ── AlmaLinux notes ──────────────────────────────────────────────
+echo -e "  ${HACK}╔══[ALM] ALMALINUX NOTES ══════════════════════════╗${RESET}"
+echo -e "  ${HACK}║${RESET}  Distro      ${HACK_DIM}:${RESET}  ${OS_DISPLAY}"
+echo -e "  ${HACK}║${RESET}  Firewall    ${HACK_DIM}:${RESET}  firewalld"
+echo -e "  ${HACK}║${RESET}  SELinux     ${HACK_DIM}:${RESET}  $(getenforce 2>/dev/null || echo 'N/A')"
+echo -e "  ${HACK}║${RESET}  EPEL repo   ${HACK_DIM}:${RESET}  ${HACK}enabled${RESET}"
+echo -e "  ${HACK}║${RESET}  Docker src  ${HACK_DIM}:${RESET}  ${DOCKER_DNF_REPO#https://}"
+echo -e "  ${HACK}╚═══════════════════════════════════════════════════╝${RESET}"
+echo ""
 
 echo -e "  ${HACK}[+]${RESET} ${BOLD}NODE CLEARED :: DNS SAAS DEPLOYMENT READY${RESET}"
 echo ""
