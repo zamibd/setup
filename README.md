@@ -16,20 +16,24 @@ Production-oriented Linux host bootstrap for **DNS SaaS** nodes. Prepares the OS
 
 > Requires **root** (or `sudo`). Test on staging first. Review `.env` before production.
 
-### curl (recommended — download + run)
+### curl (recommended — download, edit .env, run)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zamibd/setup/main/setup.sh -o setup.sh && \
 curl -fsSL https://raw.githubusercontent.com/zamibd/setup/main/.env.example -o .env && \
-chmod +x setup.sh && bash setup.sh
+nano .env && \
+chmod +x setup.sh && sudo bash setup.sh
 ```
 
-Use `sudo bash setup.sh` if you are not root.
+Set at minimum in `.env` before running: `SSH_PUBLIC_KEY`, and optionally `SSH_WHITELIST_IPS`.
 
-### curl (pipe — fastest)
+If you skip `nano .env`, setup opens the editor at start (interactive terminal only). Phase 10 does **not** prompt for SSH keys or IPs.
+
+### curl (pipe — non-interactive only)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zamibd/setup/main/setup.sh | bash
+# Requires /etc/rahmat/.env with SSH_PUBLIC_KEY set first
+curl -fsSL https://raw.githubusercontent.com/zamibd/setup/main/setup.sh | sudo bash
 ```
 
 ### wget (download + run)
@@ -37,7 +41,8 @@ curl -fsSL https://raw.githubusercontent.com/zamibd/setup/main/setup.sh | bash
 ```bash
 wget -qO setup.sh https://raw.githubusercontent.com/zamibd/setup/main/setup.sh && \
 wget -qO .env https://raw.githubusercontent.com/zamibd/setup/main/.env.example && \
-chmod +x setup.sh && bash setup.sh
+nano .env && \
+chmod +x setup.sh && sudo bash setup.sh
 ```
 
 ### wget (pipe)
@@ -81,7 +86,7 @@ If your default branch is not `main`, replace `main` with `master` in the URLs a
 | 07 | Kernel Tuning | DNS/DoT sysctl (53 udp/tcp, 853 tcp) + TCP BBR |
 | 08 | Firewall | Opens service ports, blocks ICMP ping (firewalld) |
 | 09 | DDoS Protection | iptables rate limits + `rahmat-ddos.service` |
-| 10 | SSH Hardening | Keys, whitelist, `sshd` drop-in |
+| 10 | SSH Hardening | Applies `.env` key, whitelist, `sshd` drop-in (no prompts) |
 | 11 | Fail2Ban | `sshd` + `recidive` jails |
 | 12 | SELinux | DNS/Docker booleans |
 | 13 | Auto Updates | `dnf-automatic` |
@@ -239,11 +244,41 @@ This script prepares the **host**. Deploy your DNS SaaS stack on Docker after se
 
 | Issue | Action |
 |-------|--------|
-| Locked out of SSH | Use provider console; fix `/etc/ssh/sshd_config.d/99-rahmat.conf` |
+| Locked out of SSH | Use provider console (see below) |
 | Docker won't start | `journalctl -xeu docker.service` |
 | DDoS blocks legit users | Raise `DOT_*` in `.env`, restart `rahmat-ddos` |
 | Port 53 in use | Stop `systemd-resolved` / `named`; re-run phase 14 |
 | Fail2Ban ban | `fail2ban-client status sshd` |
+
+### SSH lockout recovery (provider console)
+
+Setup never prompts for SSH keys — set `SSH_PUBLIC_KEY` in `.env` before running. If the key is missing, root password login stays enabled so you are not locked out.
+
+1. Open your VPS **serial / web console** (not SSH).
+2. Log in as root with the provider password.
+3. Quick restore (password login):
+
+```bash
+sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config.d/99-rahmat.conf
+sshd -t && systemctl reload sshd
+```
+
+4. Or install your key and keep hardening:
+
+```bash
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+echo 'ssh-ed25519 AAAA... your-key' >> /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+```
+
+5. Check other blockers:
+
+```bash
+fail2ban-client status sshd          # unban: fail2ban-client set sshd unbanip YOUR_IP
+firewall-cmd --list-all              # whitelist rules may block port 22 except listed IPs
+```
+
+**Before `curl | bash` in production**, create `/etc/rahmat/.env` with at least `SSH_PUBLIC_KEY` and your IP in `SSH_WHITELIST_IPS`.
 
 ---
 
